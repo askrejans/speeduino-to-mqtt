@@ -1,0 +1,5 @@
+port_name = "/dev/ttyACM0"
+baud_rate = 115200
+mqtt_host = "localhost"
+mqtt_port = 1883
+mqtt_base_topic = "/GOLF86/ECU/"
