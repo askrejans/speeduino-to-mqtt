@@ -7,7 +7,7 @@ This software is currently in the early stages of development. Use it at your ow
 
 ## Features
 
-- Reads Speeduino ECU serial communications, sends the "A" command, and parses the engine data returned.
+- Reads Speeduino ECU serial communications, sends the "A" [command](https://wiki.speeduino.com/en/reference/Interface_Protocol), and parses the engine data returned.
 - Transmits parsed basic engine data to an MQTT broker.
 
 ## Usage
