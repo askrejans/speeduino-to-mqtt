@@ -1,8 +1,6 @@
 use crate::config::AppConfig;
-use crate::mqtt_handler::setup_mqtt;
 use paho_mqtt as mqtt;
 use std::sync::Arc;
-use tokio::task;
 
 /// Represents the Speeduino ECU data structure.
 #[derive(Debug)]
@@ -74,12 +72,12 @@ pub fn process_speeduino_realtime_data(
     // Confirming the received instruction
     let confirmation_byte = data[0];
     if confirmation_byte != 0x41 {
-        eprintln!("Invalid confirmation byte received. Expected A");
-        return;
+        //  eprintln!("Invalid confirmation byte received. Expected A");
+        // return;
     }
 
     // Extracting the Realtime Data List
-    let realtime_data = &data[1..];
+    let realtime_data = &data[0..];
     // Parse the Realtime Data List
     let speeduino_data = parse_realtime_data(realtime_data);
 
@@ -302,4 +300,63 @@ fn publish_param_to_mqtt(
     client
         .publish(message)
         .expect("Failed to publish message to MQTT");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_realtime_data_valid() {
+        let data: [u8; 41] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+            0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
+        ];
+
+        let result = parse_realtime_data(&data);
+
+        // Assert that all fields are correctly parsed
+        assert_eq!(result.secl, 0x01);
+        assert_eq!(result.status1, 0x02);
+        assert_eq!(result.engine, 0x03);
+        assert_eq!(result.dwell, 0x04);
+        assert_eq!(result.map_low, 0x05);
+        assert_eq!(result.map_high, 0x06);
+        assert_eq!(result.mat, 0x07);
+        assert_eq!(result.coolant_adc, 0x08);
+        assert_eq!(result.bat_correction, 0x09);
+        assert_eq!(result.battery_10, 0x0A);
+        assert_eq!(result.o2_primary, 0x0B);
+        assert_eq!(result.ego_correction, 0x0C);
+        assert_eq!(result.iat_correction, 0x0D);
+        assert_eq!(result.wue_correction, 0x0E);
+        assert_eq!(result.rpm_low, 0x0F);
+        assert_eq!(result.rpm_high, 0x10);
+        assert_eq!(result.tae_amount, 0x11);
+        assert_eq!(result.corrections, 0x12);
+        assert_eq!(result.ve, 0x13);
+        assert_eq!(result.afr_target, 0x14);
+        assert_eq!(result.pw1_low, 0x15);
+        assert_eq!(result.pw1_high, 0x16);
+        assert_eq!(result.tps_dot, 0x17);
+        assert_eq!(result.advance, 0x18);
+        assert_eq!(result.tps, 0x19);
+        assert_eq!(result.loops_per_second_low, 0x1A);
+        assert_eq!(result.loops_per_second_high, 0x1B);
+        assert_eq!(result.free_ram_low, 0x1C);
+        assert_eq!(result.free_ram_high, 0x1D);
+        assert_eq!(result.boost_target, 0x1E);
+        assert_eq!(result.boost_duty, 0x1F);
+        assert_eq!(result.spark, 0x20);
+        assert_eq!(result.rpm_dot_low, 0x21);
+        assert_eq!(result.rpm_dot_high, 0x22);
+        assert_eq!(result.ethanol_pct, 0x23);
+        assert_eq!(result.flex_correction, 0x24);
+        assert_eq!(result.flex_ign_correction, 0x25);
+        assert_eq!(result.idle_load, 0x26);
+        assert_eq!(result.test_outputs, 0x27);
+        assert_eq!(result.o2_secondary, 0x28);
+        assert_eq!(result.baro, 0x29);
+    }
 }

@@ -1,6 +1,5 @@
 use crate::config::AppConfig;
 use paho_mqtt as mqtt;
-use std::process;
 use std::sync::Arc;
 
 /// Set up and return an MQTT client based on the provided configuration.
@@ -12,33 +11,52 @@ use std::sync::Arc;
 ///
 /// * `config` - A reference to the `AppConfig` struct containing MQTT configuration information.
 ///
-/// # Panics
-///
-/// Panics if there is an error creating the MQTT client or if it fails to connect to the broker.
-///
 /// # Returns
 ///
-/// Returns an MQTT client upon successful setup and connection.
-pub fn setup_mqtt(config: &Arc<AppConfig>) -> mqtt::Client {
+/// Returns a `Result` containing the MQTT client upon successful setup and connection or an error if the connection fails.
+pub fn setup_mqtt(config: &Arc<AppConfig>) -> Result<mqtt::Client, mqtt::Error> {
     // Format the MQTT broker host and port.
     let host = format!("mqtt://{}:{}", config.mqtt_host, config.mqtt_port);
 
     // Create an MQTT client.
-    let cli = mqtt::Client::new(host).unwrap_or_else(|e| {
-        // Print an error message and exit the program if client creation fails.
-        println!("Error creating the client: {:?}", e);
-        process::exit(1);
-    });
+    let cli = mqtt::Client::new(host)?;
 
     // Use the `connect` method to connect to the broker.
-    match cli.connect(None) {
-        Ok(_) => {
-            println!("Connected to MQTT broker");
-            cli // Return the MQTT client after successful connection.
-        }
-        Err(e) => {
-            println!("Failed to connect to MQTT broker: {:?}", e);
-            process::exit(1);
-        }
+    cli.connect(None)?;
+
+    println!(
+        "Connected to MQTT broker on {}:{}",
+        config.mqtt_host, config.mqtt_port
+    );
+
+    Ok(cli) // Return the MQTT client after successful connection.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn test_setup_mqtt() {
+        // Create a dummy AppConfig for testing
+        let config = Arc::new(AppConfig {
+            port_name: String::from("COM1"),
+            baud_rate: 9600,
+            mqtt_host: String::from("test.example.com"),
+            mqtt_port: 1883,
+            mqtt_base_topic: String::from("sensors"),
+            ..Default::default()
+        });
+
+        // Use a Mutex to ensure the test runs sequentially
+        let mutex = Mutex::new(());
+        let _guard = mutex.lock().unwrap();
+
+        // Test the setup_mqtt function
+        let result = setup_mqtt(&config);
+
+        // Check if the result is an Err, indicating a connection failure
+        assert!(result.is_err());
     }
 }
