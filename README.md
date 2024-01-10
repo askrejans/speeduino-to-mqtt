@@ -12,9 +12,9 @@ This software is currently in the early stages of development. Use it at your ow
 
 ## Usage
 
-1. Download the latest release from the [releases page](https://github.com/your-username/speeduino-to-mqtt).
+1. Download the latest tagged release
 
-2. Edit the `settings.toml` file with your configurations. An example `settings.toml` is included in the root directory.
+2. Edit the `settings.toml` file with your configurations. An `example.settings.toml` is included in the root directory.
 
 3. Build the application by setting up the Rust build environment and executing `cargo build --release`.
 
