@@ -920,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "speeduino-to-mqtt"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "config",
  "futures",

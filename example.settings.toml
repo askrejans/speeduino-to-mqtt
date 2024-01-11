@@ -1,6 +1,19 @@
+# settings.toml
+
+# The serial port name or path. Adjust this based on your system configuration.
 port_name = "/dev/ttyACM0"
+
+# Baud rate for serial communication with the device.
 baud_rate = 115200
+
+# MQTT broker host address. Change to the appropriate host where your MQTT broker is running.
 mqtt_host = "localhost"
+
+# MQTT broker port number.
 mqtt_port = 1883
+
+# Base MQTT topic for communication. Customize based on your project or device.
 mqtt_base_topic = "/GOLF86/ECU/"
+
+# Refresh rate in milliseconds for data updates or transmissions.
 refresh_rate_ms = 20

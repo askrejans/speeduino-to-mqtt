@@ -69,13 +69,6 @@ pub fn process_speeduino_realtime_data(
         return;
     }
 
-    // Confirming the received instruction
-    let confirmation_byte = data[0];
-    if confirmation_byte != 0x41 {
-        //  eprintln!("Invalid confirmation byte received. Expected A");
-        // return;
-    }
-
     // Extracting the Realtime Data List
     let realtime_data = &data[0..];
     // Parse the Realtime Data List
@@ -106,8 +99,6 @@ fn parse_realtime_data(data: &[u8]) -> SpeeduinoData {
             }
         }};
     }
-
-    // Other macro_rules for reading bytes, signed bytes, and canin array go here...
 
     // Create a SpeeduinoData instance by reading each field
     SpeeduinoData {
@@ -183,31 +174,51 @@ fn publish_speeduino_params_to_mqtt(
 ) {
     // List of parameters to publish
     let params_to_publish: Vec<(&str, String)> = vec![
+        // RPM: Engine revolutions per minute
         (
             "RPM",
             combine_bytes(speeduino_data.rpm_high, speeduino_data.rpm_low).to_string(),
         ),
+        // TPS: Throttle Position Sensor reading (0% to 100%)
         ("TPS", speeduino_data.tps.to_string()),
+        // VE: Volumetric Efficiency (%)
         ("VE", speeduino_data.ve.to_string()),
-        ("O2P", speeduino_data.o2_primary.to_string()),
+        // O2P: Primary O2 sensor reading
+        ("O2P", (speeduino_data.o2_primary as f32 / 10.0).to_string()),
+        // MAT: Manifold Air Temperature sensor reading
         ("MAT", speeduino_data.mat.to_string()),
+        // CAD: Coolant Analog-to-Digital Conversion value
         ("CAD", speeduino_data.coolant_adc.to_string()),
+        // DWL: Dwell time
         ("DWL", speeduino_data.dwell.to_string()),
+        // MAP: Manifold Absolute Pressure sensor reading
         (
             "MAP",
             combine_bytes(speeduino_data.map_high, speeduino_data.map_low).to_string(),
         ),
-        ("O2S", speeduino_data.o2_secondary.to_string()),
+        // O2S: Secondary O2 sensor reading
+        (
+            "O2S",
+            (speeduino_data.o2_secondary as f32 / 10.0).to_string(),
+        ),
+        // ITC: Manifold Air Temperature Correction (%)
         ("ITC", speeduino_data.iat_correction.to_string()),
+        // TAE: Warm-Up Enrichment Correction (%)
         ("TAE", speeduino_data.tae_amount.to_string()),
+        // COR: Total GammaE (%)
         ("COR", speeduino_data.corrections.to_string()),
-        ("AFT", speeduino_data.afr_target.to_string()),
+        // AFT: Air-Fuel Ratio Target
+        ("AFT", (speeduino_data.afr_target as f32 / 10.0).to_string()),
+        // PW1: Pulse Width 1
         (
             "PW1",
             combine_bytes(speeduino_data.pw1_high, speeduino_data.pw1_low).to_string(),
         ),
+        // TPD: Throttle Position Sensor Change per Second
         ("TPD", speeduino_data.tps_dot.to_string()),
+        // ADV: Ignition Advance
         ("ADV", speeduino_data.advance.to_string()),
+        // LPS: Loops per Second
         (
             "LPS",
             combine_bytes(
@@ -216,23 +227,35 @@ fn publish_speeduino_params_to_mqtt(
             )
             .to_string(),
         ),
+        // FRM: Free RAM
         (
             "FRM",
             combine_bytes(speeduino_data.free_ram_high, speeduino_data.free_ram_low).to_string(),
         ),
+        // BST: Boost Target
         ("BST", speeduino_data.boost_target.to_string()),
+        // BSD: Boost Duty
         ("BSD", speeduino_data.boost_duty.to_string()),
+        // SPK: Spark
         ("SPK", speeduino_data.spark.to_string()),
+        // RPD: RPM DOT (assuming signed integer)
         (
             "RPD",
             combine_bytes(speeduino_data.rpm_dot_high, speeduino_data.rpm_dot_low).to_string(),
         ),
+        // ETH: Ethanol Percentage
         ("ETH", speeduino_data.ethanol_pct.to_string()),
+        // FLC: Flex Fuel Correction
         ("FLC", speeduino_data.flex_correction.to_string()),
+        // FIC: Flex Fuel Ignition Correction
         ("FIC", speeduino_data.flex_ign_correction.to_string()),
+        // ILL: Idle Load
         ("ILL", speeduino_data.idle_load.to_string()),
+        // TOF: Test Outputs
         ("TOF", speeduino_data.test_outputs.to_string()),
+        // BAR: Barometric Pressure
         ("BAR", speeduino_data.baro.to_string()),
+        // CN1 to CN8: CAN Input values (Combine bytes)
         (
             "CN1",
             combine_bytes(speeduino_data.canin[1], speeduino_data.canin[0]).to_string(),
@@ -265,14 +288,23 @@ fn publish_speeduino_params_to_mqtt(
             "CN8",
             combine_bytes(speeduino_data.canin[15], speeduino_data.canin[14]).to_string(),
         ),
+        // TAD: Throttle Position Sensor ADC value
         ("TAD", speeduino_data.tps_adc.to_string()),
+        // NER: Next Error code
         ("NER", speeduino_data.next_error.to_string()),
+        // STA: Status 1
         ("STA", speeduino_data.status1.to_string()),
+        // ENG: Engine status
         ("ENG", speeduino_data.engine.to_string()),
+        // BTC: Battery Temperature Correction
         ("BTC", speeduino_data.bat_correction.to_string()),
-        ("BAT", speeduino_data.battery_10.to_string()),
+        // BAT: Battery voltage (scaled by 10)
+        ("BAT", (speeduino_data.battery_10 as f32 / 10.0).to_string()),
+        // EGC: EGO Correction
         ("EGC", speeduino_data.ego_correction.to_string()),
+        // WEC: Warm-Up Enrichment Correction
         ("WEC", speeduino_data.wue_correction.to_string()),
+        // SCL: Secondary Load
         ("SCL", speeduino_data.secl.to_string()),
     ];
 

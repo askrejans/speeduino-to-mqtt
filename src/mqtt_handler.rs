@@ -14,15 +14,20 @@ use std::sync::Arc;
 /// # Returns
 ///
 /// Returns a `Result` containing the MQTT client upon successful setup and connection or an error if the connection fails.
-pub fn setup_mqtt(config: &Arc<AppConfig>) -> Result<mqtt::Client, mqtt::Error> {
+pub fn setup_mqtt(config: &Arc<AppConfig>) -> Result<mqtt::Client, String> {
     // Format the MQTT broker host and port.
     let host = format!("mqtt://{}:{}", config.mqtt_host, config.mqtt_port);
 
     // Create an MQTT client.
-    let cli = mqtt::Client::new(host)?;
+    let cli = match mqtt::Client::new(host) {
+        Ok(client) => client,
+        Err(err) => return Err(format!("Failed to create MQTT client: {}", err)),
+    };
 
     // Use the `connect` method to connect to the broker.
-    cli.connect(None)?;
+    if let Err(err) = cli.connect(None) {
+        return Err(format!("Failed to connect to MQTT broker: {}", err));
+    }
 
     println!(
         "Connected to MQTT broker on {}:{}",
@@ -50,13 +55,19 @@ mod tests {
         });
 
         // Use a Mutex to ensure the test runs sequentially
-        let mutex = Mutex::new(());
-        let _guard = mutex.lock().unwrap();
+        let _guard = Mutex::new().lock().unwrap();
 
         // Test the setup_mqtt function
         let result = setup_mqtt(&config);
 
         // Check if the result is an Err, indicating a connection failure
-        assert!(result.is_err());
+        match result {
+            Ok(_) => panic!("Expected setup_mqtt to return Err, but it returned Ok."),
+            Err(_) => {
+                // Handle the error and exit with code 1
+                eprintln!("Error: Failed to set up MQTT.");
+                std::process::exit(1);
+            }
+        }
     }
 }
