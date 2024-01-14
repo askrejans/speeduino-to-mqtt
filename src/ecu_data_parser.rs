@@ -182,7 +182,7 @@ fn publish_speeduino_params_to_mqtt(
         // TPS: Throttle Position Sensor reading (0% to 100%)
         ("TPS", speeduino_data.tps.to_string()),
         // VE: Volumetric Efficiency (%)
-        ("VE", speeduino_data.ve.to_string()),
+        ("VE1", speeduino_data.ve.to_string()),
         // O2P: Primary O2 sensor reading
         ("O2P", (speeduino_data.o2_primary as f32 / 10.0).to_string()),
         // MAT: Manifold Air Temperature sensor reading
