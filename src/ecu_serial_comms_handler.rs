@@ -73,32 +73,35 @@ pub fn start_ecu_communication() {
         let mqtt_client = mqtt_client.clone();
         let port = port.clone();
         let should_exit = should_exit.clone();
-
+    
         move || {
             let mut last_send_time = Instant::now();
             let mut connected = false; // Flag to track connection status
             println!("Connecting to Speeduino ECU..");
-
+    
             loop {
                 let elapsed_time = last_send_time.elapsed();
                 if elapsed_time >= *COMMAND_INTERVAL {
                     // Read the entire engine data message length in the buffer
                     let engine_data = read_engine_data(&mut port.lock().unwrap());
-
+    
                     // Process the engine data only if it's not empty
                     if !engine_data.is_empty() {
                         process_speeduino_realtime_data(&engine_data, &arc_config, &mqtt_client);
-
+    
                         // Print the connection message only if not connected
                         if !connected {
                             println!("Successfully connected to Speeduino ECU");
                             connected = true;
                         }
                     }
-
+    
                     last_send_time = Instant::now();
+                } else {
+                    // Sleep for a short duration to avoid busy waiting
+                    thread::sleep(Duration::from_millis(10));
                 }
-
+    
                 // Check for a quit command from the main thread
                 if let Ok(message) = receiver.try_recv() {
                     if message == "q" {
@@ -106,7 +109,7 @@ pub fn start_ecu_communication() {
                         break;
                     }
                 }
-
+    
                 // Check if the main thread has signaled to exit
                 if *should_exit.lock().unwrap() {
                     println!("Exiting the communication thread.");
@@ -115,6 +118,7 @@ pub fn start_ecu_communication() {
             }
         }
     });
+    
 
     // Add a loop in the main thread to handle user input
     loop {
