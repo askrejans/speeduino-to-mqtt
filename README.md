@@ -26,3 +26,33 @@ This software is in early development, so use it at your own risk. It's been tes
 
    ```bash
    ./target/release/speeduino-to-mqtt
+
+## MQTT data example:
+Data is pushed as 3 letter codes (explained in source) to a configured MQTT topic.
+```code
+RPM: Engine revolutions per minute
+TPS: Throttle Position Sensor reading (0% to 100%)
+VE1: Volumetric Efficiency (%)
+O2P: Primary O2 sensor reading
+AFT: Air-Fuel Ratio Target
+MAT: Manifold Air Temperature sensor reading
+CAD: Coolant Analog-to-Digital Conversion value
+MAP: Manifold Absolute Pressure sensor reading
+BAT: Battery voltage (scaled by 10)
+ADV: Ignition Advance
+PW1: Pulse Width 1
+SPK: Spark
+DWL: Dwell time
+ILL: Idle Load
+BAR: Barometric Pressure
+TAE: Warm-Up Enrichment Correction (%)
+NER: Next Error code
+ENG: Engine status
+```
+More info:  [wiki.speeduino.com](https://wiki.speeduino.com/en/reference/Interface_Protocol)
+
+![image](https://github.com/askrejans/speeduino-to-mqtt/assets/1042303/d1b8cbd3-3f9a-471b-8dc1-bf206eb39693)
+
+
+
+
