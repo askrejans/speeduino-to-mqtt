@@ -73,52 +73,52 @@ pub fn start_ecu_communication(config: AppConfig) {
         let mqtt_client = mqtt_client.clone();
         let port = port.clone();
         let should_exit = should_exit.clone();
-
+    
         move || {
             let mut last_send_time = Instant::now();
             let mut connected = false;
             println!("Connecting to Speeduino ECU..");
-
-            
+    
             // Create a Condvar and Mutex for signaling and waiting
-            let condvar = Arc::new((Mutex::new(()), Condvar::new()));
-            let (mutex, cvar) = &*condvar;
-
+            let condvar_comm = Arc::new((Mutex::new(()), Condvar::new()));
+            let (mutex_comm, cvar_comm) = &*condvar_comm;
+    
             loop {
                 let elapsed_time = last_send_time.elapsed();
+    
                 if elapsed_time >= *COMMAND_INTERVAL {
                     let engine_data = read_engine_data(&mut port.lock().unwrap());
-
+    
                     if !engine_data.is_empty() {
                         process_speeduino_realtime_data(&engine_data, &arc_config_thread, &mqtt_client);
-
+    
                         if !connected {
                             println!("Successfully connected to Speeduino ECU");
                             connected = true;
                         }
                     }
-
+    
                     last_send_time = Instant::now();
                 } else {
                     // Calculate the time remaining until the next COMMAND_INTERVAL
                     let remaining_time = *COMMAND_INTERVAL - elapsed_time;
-
+    
                     // Use Condvar to efficiently wait for the remaining time
-                    let _guard = cvar
-                        .wait_timeout(mutex.lock().unwrap(), remaining_time)
+                    let (_guard, _) = cvar_comm
+                        .wait_timeout(mutex_comm.lock().unwrap(), remaining_time)
                         .unwrap();
-
+    
                     // The lock is automatically released while waiting, and reacquired after waking up
                     last_send_time = Instant::now();
                 }
-
+    
                 if let Ok(message) = receiver.try_recv() {
                     if message == "q" {
                         println!("Received quit command. Exiting the communication thread.");
                         break;
                     }
                 }
-
+    
                 if *should_exit.lock().unwrap() {
                     println!("Exiting the communication thread.");
                     break;
