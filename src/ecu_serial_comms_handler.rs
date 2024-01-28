@@ -153,8 +153,10 @@ pub fn start_ecu_communication(config: AppConfig) {
             }
         }
     } else {
-        // Running as a service, print a message
-        println!("Running as a service. Interactive input disabled.");
+        // Running as a service, run empty loop to keep program active.
+        loop {
+            thread::sleep(Duration::from_millis(15));
+        }
     }
     
 }
