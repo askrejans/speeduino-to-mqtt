@@ -99,6 +99,7 @@ pub fn start_ecu_communication(config: AppConfig) {
                     }
     
                     last_send_time = Instant::now();
+                    cvar_comm.notify_one();
                 } else {
                     // Calculate the time remaining until the next COMMAND_INTERVAL
                     let remaining_time = *COMMAND_INTERVAL - elapsed_time;
@@ -134,25 +135,25 @@ pub fn start_ecu_communication(config: AppConfig) {
     loop {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).expect("Failed to read line");
-
+    
         let trimmed_input = input.trim();
-
+    
         // Send quit command to the communication thread
         arc_sender.lock().unwrap().send(trimmed_input.to_string()).unwrap();
-
+    
         if trimmed_input.eq_ignore_ascii_case("q") {
             // Signal the communication thread to exit
             *should_exit.lock().unwrap() = true;
-
-            // Signal the Condvar to wake up the communication thread
-            cvar_main.notify_one();
-
+    
             println!("Shutting down. Goodbye!");
             // Terminate the entire program
             std::process::exit(0);
         } else {
             println!("Unknown command. Type 'q' to exit.");
         }
+    
+        // Wait for the communication thread to finish processing the command
+        let _guard = cvar_main.wait(should_exit.lock().unwrap());
     }
 }
 
