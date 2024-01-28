@@ -125,34 +125,38 @@ pub fn start_ecu_communication(config: AppConfig) {
     let is_interactive = atty::is(Stream::Stdin);
 
     if is_interactive {
-    // Add a loop in the main thread to handle user input
-    loop {
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .expect("Failed to read line");
-
-        let trimmed_input = input.trim();
-
-        // Send quit command to the communication thread
-        arc_sender
-            .lock()
-            .unwrap()
-            .send(trimmed_input.to_string())
-            .unwrap();
-
-        if trimmed_input.eq_ignore_ascii_case("q") {
-            // Signal the communication thread to exit
-            *should_exit.lock().unwrap() = true;
-
-            println!("Shutting down. Goodbye!");
-            // Terminate the entire program
-            std::process::exit(0);
-        } else {
-            println!("Unknown command. Type 'q' to exit.");
+        // Add a loop in the main thread to handle user input
+        loop {
+            let mut input = String::new();
+            match std::io::stdin().read_line(&mut input) {
+                Ok(0) => break,  // EOF
+                Ok(_) => {
+                    let trimmed_input = input.trim();
+    
+                    // Send quit command to the communication thread
+                    arc_sender.lock().unwrap().send(trimmed_input.to_string()).unwrap();
+    
+                    if trimmed_input.eq_ignore_ascii_case("q") {
+                        // Signal the communication thread to exit
+                        *should_exit.lock().unwrap() = true;
+                        println!("Shutting down. Goodbye!");
+                        // Terminate the entire program
+                        std::process::exit(0);
+                    } else {
+                        println!("Unknown command. Type 'q' to exit.");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error reading input: {}", err);
+                    break;
+                }
+            }
         }
+    } else {
+        // Running as a service, print a message
+        println!("Running as a service. Interactive input disabled.");
     }
-}
+    
 }
 
 /// Read the entire engine data message length in the buffer.
