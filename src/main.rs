@@ -19,12 +19,31 @@
 ///
 /// - `main()`: The main function that starts the ECU communication and displays the welcome message.
 /// - `displayWelcome()`: Function to display a graphical welcome message.
+
 mod config;
 mod ecu_data_parser;
 mod ecu_serial_comms_handler;
 mod mqtt_handler;
-
+use gumdrop::Options;
 use ecu_serial_comms_handler::start_ecu_communication;
+use crate::config::load_configuration;
+
+/// Define options for the program.
+#[derive(Debug, Options)]
+struct MyOptions {
+    #[options(help = "print help message")]
+    help: bool,
+
+    #[options(help = "Sets a custom config file", meta = "FILE")]
+    config: Option<String>,
+}
+
+fn print_help() {
+    println!("Usage: gps-to-mqtt [options]");
+    println!("Options:");
+    println!("  -h, --help               Print this help message");
+    println!("  -c, --config FILE        Sets a custom config file path");
+}
 
 /// Displays a graphical welcome message.
 fn display_welcome() {
@@ -37,11 +56,32 @@ fn display_welcome() {
 #[tokio::main]
 /// The main function that starts the ECU communication and displays the welcome message.
 async fn main() {
+
+    // Parse CLI arguments using gumdrop
+    let opts = MyOptions::parse_args_default_or_exit();
+
+    if opts.help {
+        // Use custom print_help function to display help and exit
+        print_help();
+        std::process::exit(0);
+    }
+
     // Display welcome message
     display_welcome();
 
+        // Load configuration, set up serial port, and start processing
+        let config_path = opts.config.as_deref();
+        let config = match load_configuration(config_path) {
+            Ok(config) => config,
+            Err(err) => {
+                // Handle the error gracefully, print a message, and exit
+                eprintln!("Error loading configuration: {}", err);
+                std::process::exit(1);
+            }
+        };
+
     // Start ECU communication
-    start_ecu_communication();
+    start_ecu_communication(config.clone());
 }
 
 #[cfg(test)]

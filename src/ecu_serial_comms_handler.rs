@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 lazy_static! {
     /// Interval between commands sent to the ECU.
     static ref COMMAND_INTERVAL: Duration = Duration::from_millis(
-        load_configuration().refresh_rate_ms.unwrap_or(1000)
+        load_configuration(None).unwrap().refresh_rate_ms.unwrap_or(1000)
     );
 
     /// Length of the engine data message.
@@ -41,8 +41,8 @@ pub fn setup_serial_port(config: &AppConfig) -> Result<Box<dyn SerialPort>, seri
 ///
 /// This function continuously reads data from the serial port, processes the engine data,
 /// and communicates with the MQTT broker based on the provided configuration.
-pub fn start_ecu_communication() {
-    let config = load_configuration();
+pub fn start_ecu_communication(config: AppConfig) {
+
     let arc_config = Arc::new(config);
 
     // Setup MQTT outside the loop
@@ -68,8 +68,9 @@ pub fn start_ecu_communication() {
     // Flag to indicate whether the program should exit
     let should_exit = Arc::new(Mutex::new(false));
 
+    let arc_config_thread = arc_config.clone();
+
     thread::spawn({
-        let arc_config = arc_config.clone();
         let mqtt_client = mqtt_client.clone();
         let port = port.clone();
         let should_exit = should_exit.clone();
@@ -87,7 +88,7 @@ pub fn start_ecu_communication() {
     
                     // Process the engine data only if it's not empty
                     if !engine_data.is_empty() {
-                        process_speeduino_realtime_data(&engine_data, &arc_config, &mqtt_client);
+                        process_speeduino_realtime_data(&engine_data, &arc_config_thread, &mqtt_client);
     
                         // Print the connection message only if not connected
                         if !connected {

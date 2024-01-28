@@ -1,6 +1,8 @@
-use config::Config;
+use config::{Config, File};
+use std::path::Path;
 
 /// Struct to hold the application configuration.
+#[derive(Clone)]
 pub struct AppConfig {
     /// The name of the serial port.
     pub port_name: String,
@@ -19,6 +21,9 @@ pub struct AppConfig {
 
     /// Refresh rate in milliseconds.
     pub refresh_rate_ms: Option<u64>,
+
+    // Optional: Path to the configuration file
+    pub config_path: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -30,29 +35,51 @@ impl Default for AppConfig {
             mqtt_port: 1883, // Provide a default MQTT port value
             mqtt_base_topic: String::new(),
             refresh_rate_ms: Some(1000), // Set the default refresh rate to 1000ms
+            config_path: None
         }
     }
 }
 
 /// Load application configuration from a TOML file.
 ///
-/// This function reads the configuration settings from a TOML file named "settings.toml".
-/// It expects the following keys in the TOML file: "port_name", "baud_rate", "mqtt_host", "mqtt_port", and "mqtt_base_topic".
+/// This function reads the configuration settings from a TOML file.
 ///
-/// # Panics
-/// Panics if any of the required configuration keys are missing or if there is an error reading the configuration file.
+/// # Arguments
+/// - `config_path`: An optional path to the configuration file.
 ///
 /// # Returns
-/// Returns an `AppConfig` struct containing the loaded configuration.
-pub fn load_configuration() -> AppConfig {
-    // Build a new Config object with a file source.
-    let config_file_path =
-        std::env::var("CONFIG_FILE_PATH").unwrap_or_else(|_| String::from("settings.toml"));
+/// Returns a `Result` containing either the `AppConfig` struct with the loaded configuration or an error message.
+pub fn load_configuration(config_path: Option<&str>) -> Result<AppConfig, String> {
+    // Create a default configuration
+    let mut settings = Config::default();
 
-    let settings = Config::builder()
-        .add_source(config::File::with_name(&config_file_path))
-        .build()
-        .expect("Failed to build configuration");
+    // Try to load from the passed config_path
+    if let Some(path) = config_path {
+        match Config::builder().add_source(File::with_name(path)).build() {
+            Ok(config) => settings = config,
+            Err(err) => return Err(format!("{}", err)),
+        }
+    } else {
+        // Try to load from the executable's directory
+        if let Ok(exe_dir) = std::env::current_exe() {
+            let exe_dir = exe_dir.parent().unwrap_or_else(|| Path::new("."));
+            let default_path = exe_dir.join("settings.toml");
+
+            if let Ok(config) =
+                Config::builder().add_source(File::with_name(default_path.to_str().unwrap())).build()
+            {
+                settings = config;
+            }
+        }
+
+        // Try to load from /etc/g86-car-telemetry/speeduino-to-mqtt.toml
+        if let Ok(config) = Config::builder()
+            .add_source(File::with_name("/usr/etc/g86-car-telemetry/speeduino-to-mqtt.toml"))
+            .build()
+        {
+            settings = config;
+        }
+    }
 
     // Create an AppConfig struct by extracting values from the configuration.
     let mut app_config = AppConfig {
@@ -75,13 +102,14 @@ pub fn load_configuration() -> AppConfig {
             .get_int("refresh_rate_ms")
             .map(|value| value as u64)
             .ok(),
+        config_path: config_path.map(|p| p.to_string()), // Convert &str to String
     };
     // If refresh_rate_ms is not specified in the config, use the default value (1000ms)
     if app_config.refresh_rate_ms.is_none() {
         app_config.refresh_rate_ms = Some(1000);
     }
 
-    app_config
+    Ok(app_config)
 }
 
 #[cfg(test)]

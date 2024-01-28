@@ -1,6 +1,6 @@
 [package]
 name = "speeduino-to-mqtt"
-version = "0.1.1"
+version = "0.1.4"
 edition = "2021"
 
 [dependencies]
@@ -11,6 +11,7 @@ futures = "0.3.30"
 lazy_static = "1.4.0"
 tokio = { version = "1", features = ["full"] }
 openssl = { version = "0.10.63", features = ["vendored"] }
+gumdrop = "0.8.1"
 
 [dev-dependencies]
 tempdir = "0.3.7"
