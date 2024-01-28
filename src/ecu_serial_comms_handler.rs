@@ -99,15 +99,11 @@ pub fn start_ecu_communication(config: AppConfig) {
                     }
     
                     last_send_time = Instant::now();
-                    cvar_comm.notify_one();
+                    cvar_comm.notify_all();
                 } else {
-                    // Calculate the time remaining until the next COMMAND_INTERVAL
-                    let remaining_time = *COMMAND_INTERVAL - elapsed_time;
     
                     // Use Condvar to efficiently wait for the remaining time
-                    let (_guard, _) = cvar_comm
-                        .wait_timeout(mutex_comm.lock().unwrap(), remaining_time)
-                        .unwrap();
+                    let _guard = cvar_comm.wait(mutex_comm.lock().unwrap());
     
                     // The lock is automatically released while waiting, and reacquired after waking up
                     last_send_time = Instant::now();
