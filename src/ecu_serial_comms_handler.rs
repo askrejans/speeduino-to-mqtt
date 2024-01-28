@@ -4,7 +4,7 @@ use crate::mqtt_handler::setup_mqtt;
 use lazy_static::lazy_static;
 use serialport::SerialPort;
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -67,6 +67,7 @@ pub fn start_ecu_communication(config: AppConfig) {
 
     // Flag to indicate whether the program should exit
     let should_exit = Arc::new(Mutex::new(false));
+
     let arc_config_thread = arc_config.clone();
 
     thread::spawn({
@@ -76,22 +77,20 @@ pub fn start_ecu_communication(config: AppConfig) {
     
         move || {
             let mut last_send_time = Instant::now();
-            let mut connected = false;
+            let mut connected = false; // Flag to track connection status
             println!("Connecting to Speeduino ECU..");
-    
-            // Create a Condvar and Mutex for signaling and waiting
-            let condvar_comm = Arc::new((Mutex::new(()), Condvar::new()));
-            let (mutex_comm, cvar_comm) = &*condvar_comm;
     
             loop {
                 let elapsed_time = last_send_time.elapsed();
-    
                 if elapsed_time >= *COMMAND_INTERVAL {
+                    // Read the entire engine data message length in the buffer
                     let engine_data = read_engine_data(&mut port.lock().unwrap());
     
+                    // Process the engine data only if it's not empty
                     if !engine_data.is_empty() {
                         process_speeduino_realtime_data(&engine_data, &arc_config_thread, &mqtt_client);
     
+                        // Print the connection message only if not connected
                         if !connected {
                             println!("Successfully connected to Speeduino ECU");
                             connected = true;
@@ -99,16 +98,12 @@ pub fn start_ecu_communication(config: AppConfig) {
                     }
     
                     last_send_time = Instant::now();
-                    cvar_comm.notify_all();
                 } else {
-    
-                    // Use Condvar to efficiently wait for the remaining time
-                    let _guard = cvar_comm.wait(mutex_comm.lock().unwrap());
-    
-                    // The lock is automatically released while waiting, and reacquired after waking up
-                    last_send_time = Instant::now();
+                    // Sleep for a short duration to avoid busy waiting
+                    thread::sleep(Duration::from_millis(10));
                 }
     
+                // Check for a quit command from the main thread
                 if let Ok(message) = receiver.try_recv() {
                     if message == "q" {
                         println!("Received quit command. Exiting the communication thread.");
@@ -116,6 +111,7 @@ pub fn start_ecu_communication(config: AppConfig) {
                     }
                 }
     
+                // Check if the main thread has signaled to exit
                 if *should_exit.lock().unwrap() {
                     println!("Exiting the communication thread.");
                     break;
@@ -123,33 +119,34 @@ pub fn start_ecu_communication(config: AppConfig) {
             }
         }
     });
-
-    let condvar_main = Arc::new((Mutex::new(()), Condvar::new()));
-    let (_mutex_main, cvar_main) = &*condvar_main;
+    
 
     // Add a loop in the main thread to handle user input
     loop {
         let mut input = String::new();
-        std::io::stdin().read_line(&mut input).expect("Failed to read line");
-    
+        std::io::stdin()
+            .read_line(&mut input)
+            .expect("Failed to read line");
+
         let trimmed_input = input.trim();
-    
+
         // Send quit command to the communication thread
-        arc_sender.lock().unwrap().send(trimmed_input.to_string()).unwrap();
-    
+        arc_sender
+            .lock()
+            .unwrap()
+            .send(trimmed_input.to_string())
+            .unwrap();
+
         if trimmed_input.eq_ignore_ascii_case("q") {
             // Signal the communication thread to exit
             *should_exit.lock().unwrap() = true;
-    
+
             println!("Shutting down. Goodbye!");
             // Terminate the entire program
             std::process::exit(0);
         } else {
             println!("Unknown command. Type 'q' to exit.");
         }
-    
-        // Wait for the communication thread to finish processing the command
-        let _guard = cvar_main.wait(should_exit.lock().unwrap());
     }
 }
 
