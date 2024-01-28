@@ -7,6 +7,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use atty::Stream;
 
 lazy_static! {
     /// Interval between commands sent to the ECU.
@@ -100,7 +101,7 @@ pub fn start_ecu_communication(config: AppConfig) {
                     last_send_time = Instant::now();
                 } else {
                     // Sleep for a short duration to avoid busy waiting
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(Duration::from_millis(15));
                 }
     
                 // Check for a quit command from the main thread
@@ -121,6 +122,9 @@ pub fn start_ecu_communication(config: AppConfig) {
     });
     
 
+    let is_interactive = atty::is(Stream::Stdin);
+
+    if is_interactive {
     // Add a loop in the main thread to handle user input
     loop {
         let mut input = String::new();
@@ -148,6 +152,7 @@ pub fn start_ecu_communication(config: AppConfig) {
             println!("Unknown command. Type 'q' to exit.");
         }
     }
+}
 }
 
 /// Read the entire engine data message length in the buffer.
