@@ -53,40 +53,33 @@ pub fn load_configuration(config_path: Option<&str>) -> Result<AppConfig, String
     // Create a default configuration
     let mut settings = Config::default();
 
+    // Helper function to load configuration from a given path
+    fn load_from_path(path: &str, settings: &mut Config) -> Result<(), String> {
+        Config::builder()
+            .add_source(File::with_name(path))
+            .build()
+            .map(|config| *settings = config)
+            .map_err(|err| format!("{}", err))
+    }
+
     // Try to load from the passed config_path
     if let Some(path) = config_path {
-        match Config::builder().add_source(File::with_name(path)).build() {
-            Ok(config) => settings = config,
-            Err(err) => return Err(format!("{}", err)),
-        }
+        load_from_path(path, &mut settings)?;
     } else {
         // Try to load from the executable's directory
         if let Ok(exe_dir) = std::env::current_exe() {
             let exe_dir = exe_dir.parent().unwrap_or_else(|| Path::new("."));
             let default_path = exe_dir.join("settings.toml");
 
-            if let Ok(config) =
-                Config::builder().add_source(File::with_name(default_path.to_str().unwrap())).build()
-            {
-                settings = config;
+            if let Ok(_) = load_from_path(default_path.to_str().unwrap(), &mut settings) {
+                // Successfully loaded from the executable's directory
+            } else {
+                // Try to load from /usr/etc/g86-car-telemetry/speeduino-to-mqtt.toml
+                if let Err(_) = load_from_path("/usr/etc/g86-car-telemetry/speeduino-to-mqtt.toml", &mut settings) {
+                    // If loading from the first path fails, try the second path
+                    load_from_path("/etc/g86-car-telemetry/speeduino-to-mqtt.toml", &mut settings)?;
+                }
             }
-        }
-        // Try to load from /usr/etc/g86-car-telemetry/speeduino-to-mqtt.toml
-        if let Err(_) = Config::builder()
-        .add_source(File::with_name("/usr/etc/g86-car-telemetry/speeduino-to-mqtt.toml"))
-        .build()
-        .and_then(|config| {
-            settings = config;
-            Ok(())
-        })
-        {
-        // If loading from the first path fails, try the second path
-        if let Ok(config) = Config::builder()
-            .add_source(File::with_name("/etc/g86-car-telemetry/speeduino-to-mqtt.toml"))
-            .build()
-        {
-            settings = config;
-        }
         }
     }
 
@@ -113,6 +106,7 @@ pub fn load_configuration(config_path: Option<&str>) -> Result<AppConfig, String
             .ok(),
         config_path: config_path.map(|p| p.to_string()), // Convert &str to String
     };
+
     // If refresh_rate_ms is not specified in the config, use the default value (1000ms)
     if app_config.refresh_rate_ms.is_none() {
         app_config.refresh_rate_ms = Some(1000);
@@ -124,9 +118,40 @@ pub fn load_configuration(config_path: Option<&str>) -> Result<AppConfig, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
-    fn test_load_configuration() {
+    fn test_load_configuration_from_file() {
+        // Create a temporary settings.toml file for testing
+        let toml_content = r#"
+            port_name = "COM1"
+            baud_rate = 9600
+            mqtt_host = "mqtt.example.com"
+            mqtt_port = 1883
+            mqtt_base_topic = "sensors"
+            refresh_rate_ms = 500
+        "#;
+
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let file_path = temp_dir.path().join("settings.toml");
+
+        fs::write(&file_path, toml_content).expect("Failed to write to temporary file");
+
+        // Test the load_configuration function with the temporary file path
+        let config = load_configuration(Some(file_path.to_str().unwrap())).expect("Failed to load configuration");
+
+        // Check if the loaded configuration matches the expected values
+        assert_eq!(config.port_name, "COM1");
+        assert_eq!(config.baud_rate, 9600);
+        assert_eq!(config.mqtt_host, "mqtt.example.com");
+        assert_eq!(config.mqtt_port, 1883);
+        assert_eq!(config.mqtt_base_topic, "sensors");
+        assert_eq!(config.refresh_rate_ms, Some(500));
+    }
+
+    #[test]
+    fn test_load_configuration_with_default_refresh_rate() {
         // Create a temporary settings.toml file for testing
         let toml_content = r#"
             port_name = "COM1"
@@ -136,17 +161,13 @@ mod tests {
             mqtt_base_topic = "sensors"
         "#;
 
-        let temp_dir =
-            tempdir::TempDir::new("config_test").expect("Failed to create temporary directory");
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
         let file_path = temp_dir.path().join("settings.toml");
 
-        std::fs::write(&file_path, toml_content).expect("Failed to write to temporary file");
+        fs::write(&file_path, toml_content).expect("Failed to write to temporary file");
 
-        // Set CONFIG_FILE_PATH environment variable to point to the temporary file
-        std::env::set_var("CONFIG_FILE_PATH", file_path.to_str().unwrap());
-
-        // Test the load_configuration function
-        let config = load_configuration();
+        // Test the load_configuration function with the temporary file path
+        let config = load_configuration(Some(file_path.to_str().unwrap())).expect("Failed to load configuration");
 
         // Check if the loaded configuration matches the expected values
         assert_eq!(config.port_name, "COM1");
@@ -154,5 +175,35 @@ mod tests {
         assert_eq!(config.mqtt_host, "mqtt.example.com");
         assert_eq!(config.mqtt_port, 1883);
         assert_eq!(config.mqtt_base_topic, "sensors");
+        assert_eq!(config.refresh_rate_ms, Some(1000)); // Default value
+    }
+
+    #[test]
+    fn test_load_configuration_with_missing_file() {
+        // Test the load_configuration function with a non-existent file path
+        let result = load_configuration(Some("non_existent_file.toml"));
+
+        // Check if the function returns an error
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_configuration_with_invalid_toml() {
+        // Create a temporary invalid settings.toml file for testing
+        let toml_content = r#"
+            port_name = "COM1"
+            baud_rate = "invalid_number"
+        "#;
+
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let file_path = temp_dir.path().join("settings.toml");
+
+        fs::write(&file_path, toml_content).expect("Failed to write to temporary file");
+
+        // Test the load_configuration function with the temporary file path
+        let result = load_configuration(Some(file_path.to_str().unwrap()));
+
+        // Check if the function returns an error
+        assert!(result.is_err());
     }
 }
