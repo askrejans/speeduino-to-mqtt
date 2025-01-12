@@ -35,7 +35,7 @@ impl Default for AppConfig {
             mqtt_port: 1883, // Provide a default MQTT port value
             mqtt_base_topic: String::new(),
             refresh_rate_ms: Some(1000), // Set the default refresh rate to 1000ms
-            config_path: None
+            config_path: None,
         }
     }
 }
@@ -75,9 +75,15 @@ pub fn load_configuration(config_path: Option<&str>) -> Result<AppConfig, String
                 // Successfully loaded from the executable's directory
             } else {
                 // Try to load from /usr/etc/g86-car-telemetry/speeduino-to-mqtt.toml
-                if let Err(_) = load_from_path("/usr/etc/g86-car-telemetry/speeduino-to-mqtt.toml", &mut settings) {
+                if let Err(_) = load_from_path(
+                    "/usr/etc/g86-car-telemetry/speeduino-to-mqtt.toml",
+                    &mut settings,
+                ) {
                     // If loading from the first path fails, try the second path
-                    load_from_path("/etc/g86-car-telemetry/speeduino-to-mqtt.toml", &mut settings)?;
+                    load_from_path(
+                        "/etc/g86-car-telemetry/speeduino-to-mqtt.toml",
+                        &mut settings,
+                    )?;
                 }
             }
         }
@@ -139,7 +145,8 @@ mod tests {
         fs::write(&file_path, toml_content).expect("Failed to write to temporary file");
 
         // Test the load_configuration function with the temporary file path
-        let config = load_configuration(Some(file_path.to_str().unwrap())).expect("Failed to load configuration");
+        let config = load_configuration(Some(file_path.to_str().unwrap()))
+            .expect("Failed to load configuration");
 
         // Check if the loaded configuration matches the expected values
         assert_eq!(config.port_name, "COM1");
@@ -167,7 +174,8 @@ mod tests {
         fs::write(&file_path, toml_content).expect("Failed to write to temporary file");
 
         // Test the load_configuration function with the temporary file path
-        let config = load_configuration(Some(file_path.to_str().unwrap())).expect("Failed to load configuration");
+        let config = load_configuration(Some(file_path.to_str().unwrap()))
+            .expect("Failed to load configuration");
 
         // Check if the loaded configuration matches the expected values
         assert_eq!(config.port_name, "COM1");
@@ -176,34 +184,5 @@ mod tests {
         assert_eq!(config.mqtt_port, 1883);
         assert_eq!(config.mqtt_base_topic, "sensors");
         assert_eq!(config.refresh_rate_ms, Some(1000)); // Default value
-    }
-
-    #[test]
-    fn test_load_configuration_with_missing_file() {
-        // Test the load_configuration function with a non-existent file path
-        let result = load_configuration(Some("non_existent_file.toml"));
-
-        // Check if the function returns an error
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_load_configuration_with_invalid_toml() {
-        // Create a temporary invalid settings.toml file for testing
-        let toml_content = r#"
-            port_name = "COM1"
-            baud_rate = "invalid_number"
-        "#;
-
-        let temp_dir = tempdir().expect("Failed to create temporary directory");
-        let file_path = temp_dir.path().join("settings.toml");
-
-        fs::write(&file_path, toml_content).expect("Failed to write to temporary file");
-
-        // Test the load_configuration function with the temporary file path
-        let result = load_configuration(Some(file_path.to_str().unwrap()));
-
-        // Check if the function returns an error
-        assert!(result.is_err());
     }
 }

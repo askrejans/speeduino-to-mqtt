@@ -36,11 +36,10 @@ pub fn setup_mqtt(config: &Arc<AppConfig>) -> Result<mqtt::Client, String> {
 
     Ok(cli) // Return the MQTT client after successful connection.
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn test_setup_mqtt() {
@@ -55,7 +54,8 @@ mod tests {
         });
 
         // Use a Mutex to ensure the test runs sequentially
-        let _guard = Mutex::new().lock().unwrap();
+        let mutex = Mutex::new(());
+        let _guard = mutex.lock().unwrap();
 
         // Test the setup_mqtt function
         let result = setup_mqtt(&config);

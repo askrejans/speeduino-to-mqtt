@@ -19,14 +19,14 @@
 ///
 /// - `main()`: The main function that starts the ECU communication and displays the welcome message.
 /// - `displayWelcome()`: Function to display a graphical welcome message.
-
 mod config;
 mod ecu_data_parser;
 mod ecu_serial_comms_handler;
 mod mqtt_handler;
-use gumdrop::Options;
-use ecu_serial_comms_handler::start_ecu_communication;
 use crate::config::load_configuration;
+use crate::config::AppConfig;
+use ecu_serial_comms_handler::start_ecu_communication;
+use gumdrop::Options;
 
 /// Define options for the program.
 #[derive(Debug, Options)]
@@ -45,18 +45,55 @@ fn print_help() {
     println!("  -c, --config FILE        Sets a custom config file path");
 }
 
-/// Displays a graphical welcome message.
+/// Displays the welcome message and instructions for the Speeduino To MQTT Processor application.
+///
+/// This function performs the following tasks:
+/// - Prints a welcome message in green.
+/// - Displays a car logo in red.
+/// - Provides instructions on how to use the application.
+/// - Lists the available commands for the user.
 fn display_welcome() {
+    println!("\x1b[1;32m"); // Set text color to green
     println!("\nWelcome to Speeduino To MQTT Processor!\n");
     println!("===================================");
+
+    // Display car logo in red
+    println!("\x1b[1;31m"); // Set text color to red
+    println!("       ______");
+    println!("      //  ||\\ \\");
+    println!(" ____//___||_\\ \\___");
+    println!(" )  _          _    \\");
+    println!(" |_/ \\________/ \\___|");
+    println!("___\\_/________\\_/______");
+    println!("\x1b[1;32m"); // Set text color back to green
+
+    println!("===================================\n");
+
+    println!(
+        "This application processes data from Speeduino ECU and publishes it to an MQTT broker."
+    );
+    println!("Ensure your Speeduino ECU is connected and configured properly.");
     println!("Press 'q' to quit the application.");
     println!("===================================\n");
+
+    // Display a list of available commands
+    println!("Available Commands:");
+    println!("q - Quit the application");
+    println!("===================================\n");
+
+    println!("\x1b[0m"); // Reset text color
 }
 
 #[tokio::main]
-/// The main function that starts the ECU communication and displays the welcome message.
+/// The main entry point of the application.
+///
+/// This function performs the following tasks:
+/// - Parses command-line arguments.
+/// - Displays a help message if requested.
+/// - Displays a welcome message.
+/// - Loads the configuration file.
+/// - Starts ECU communication.
 async fn main() {
-
     // Parse CLI arguments using gumdrop
     let opts = MyOptions::parse_args_default_or_exit();
 
@@ -69,19 +106,31 @@ async fn main() {
     // Display welcome message
     display_welcome();
 
-        // Load configuration, set up serial port, and start processing
-        let config_path = opts.config.as_deref();
-        let config = match load_configuration(config_path) {
-            Ok(config) => config,
-            Err(err) => {
-                // Handle the error gracefully, print a message, and exit
-                eprintln!("Error loading configuration: {}", err);
-                std::process::exit(1);
-            }
-        };
+    // Load configuration
+    let config = load_config_or_exit(opts.config.as_deref());
 
     // Start ECU communication
-    start_ecu_communication(config.clone());
+    start_ecu_communication(config);
+}
+
+/// Loads the configuration file or exits the application if an error occurs.
+///
+/// # Arguments
+///
+/// * `config_path` - An optional path to the configuration file.
+///
+/// # Returns
+///
+/// * `Config` - The loaded configuration.
+fn load_config_or_exit(config_path: Option<&str>) -> AppConfig {
+    match load_configuration(config_path) {
+        Ok(config) => config,
+        Err(err) => {
+            // Handle the error gracefully, print a message, and exit
+            eprintln!("Error loading configuration: {}", err);
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg(test)]
