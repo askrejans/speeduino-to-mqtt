@@ -3,6 +3,7 @@ use std::path::Path;
 
 /// Struct to hold the application configuration.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct AppConfig {
     /// The name of the serial port.
     pub port_name: String,

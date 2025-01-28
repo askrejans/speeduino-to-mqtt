@@ -17,7 +17,8 @@ lazy_static! {
     );
 
     /// Length of the engine data message.
-    static ref ENGINE_DATA_MESSAGE_LENGTH: usize = 119; // Adjust the length based on the expected size
+    /// Response length setfor current Speeduino firmware
+    static ref ENGINE_DATA_MESSAGE_LENGTH: usize = 120;
 }
 
 /// Set up and open a serial port based on the provided configuration.
@@ -116,6 +117,32 @@ pub fn start_ecu_communication(config: AppConfig) {
     handle_user_input(arc_sender, should_exit);
 }
 
+fn check_device_exists(port_name: &str) -> bool {
+    serialport::available_ports()
+        .map(|ports| ports.iter().any(|p| p.port_name == port_name))
+        .unwrap_or(false)
+}
+
+fn wait_for_device(port_name: &str) -> bool {
+    let max_attempts = 5;
+    let mut attempts = 0;
+
+    while attempts < max_attempts {
+        if check_device_exists(port_name) {
+            return true;
+        }
+        println!(
+            "Waiting for device {}... (attempt {}/{})",
+            port_name,
+            attempts + 1,
+            max_attempts
+        );
+        thread::sleep(Duration::from_secs(1));
+        attempts += 1;
+    }
+    false
+}
+
 /// Handles the communication with the Speeduino ECU.
 ///
 /// This function runs in a separate thread and continuously communicates with the Speeduino ECU.
@@ -152,9 +179,46 @@ fn communication_thread(
     println!("Connecting to Speeduino ECU..");
 
     loop {
+        if *should_exit.lock().unwrap() {
+            println!("Exiting the communication thread.");
+            break;
+        }
+
+        // Check if device exists
+        if !check_device_exists(&arc_config.port_name) {
+            if connected {
+                println!(
+                    "Lost connection to {} - waiting for device to return...",
+                    arc_config.port_name
+                );
+                connected = false;
+            }
+
+            // Wait for device to return
+            if !wait_for_device(&arc_config.port_name) {
+                thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+
+            // Try to reopen port
+            match setup_serial_port(&arc_config) {
+                Ok(new_port) => {
+                    let mut port_guard = port.lock().unwrap();
+                    *port_guard = new_port;
+                    println!("Reconnected to {}", arc_config.port_name);
+                }
+                Err(e) => {
+                    eprintln!("Failed to reopen port: {}", e);
+                    thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+            }
+        }
+
         let elapsed_time = last_send_time.elapsed();
         if elapsed_time >= *COMMAND_INTERVAL {
-            let engine_data = read_engine_data(&mut port.lock().unwrap());
+            let mut port_guard = port.lock().unwrap();
+            let engine_data = read_engine_data(&mut port_guard);
 
             if !engine_data.is_empty() {
                 process_speeduino_realtime_data(&engine_data, &arc_config, &mqtt_client);
@@ -162,6 +226,12 @@ fn communication_thread(
                 if !connected {
                     println!("Successfully connected to Speeduino ECU");
                     connected = true;
+                }
+            } else {
+                // Empty data might indicate connection issues
+                if connected {
+                    println!("Lost connection - will try to reconnect...");
+                    connected = false;
                 }
             }
 
@@ -175,11 +245,6 @@ fn communication_thread(
                 println!("Received quit command. Exiting the communication thread.");
                 break;
             }
-        }
-
-        if *should_exit.lock().unwrap() {
-            println!("Exiting the communication thread.");
-            break;
         }
     }
 }
@@ -254,52 +319,36 @@ fn handle_user_input(arc_sender: Arc<Mutex<mpsc::Sender<String>>>, should_exit: 
 ///
 /// Returns a vector containing the engine data.
 fn read_engine_data(port: &mut Box<dyn SerialPort>) -> Vec<u8> {
-    let mut serial_buf: Vec<u8> = vec![0; 512];
-    let mut engine_data: Vec<u8> = Vec::new();
+    let mut engine_data: Vec<u8> = Vec::with_capacity(120);
 
-    // Send "n" command
-    if let Err(e) = port.write_all("n".as_bytes()) {
-        eprintln!("Error sending 'n' command to the ECU: {:?}", e);
+    // Clear buffers
+    if let Err(e) = port.clear(serialport::ClearBuffer::All) {
+        eprintln!("Failed to clear buffers: {:?}", e);
+    }
+
+    // Set timeout
+    if let Err(e) = port.set_timeout(Duration::from_millis(2000)) {
+        eprintln!("Failed to set timeout: {:?}", e);
         return engine_data;
     }
 
-    // Read response header with timeout
-    match port.read_exact(&mut serial_buf[0..3]) {
-        Ok(_) => {
-            // Verify response header bytes
-            if serial_buf[0] != 0x6E {
-                eprintln!("Invalid response header from ECU. Expected 0x6E, got {:#x}", serial_buf[0]);
-                return engine_data;
-            }
-
-            if serial_buf[1] != 0x32 {
-                eprintln!("Invalid command type. Expected 0x32, got {:#x}", serial_buf[1]);
-                return engine_data;
-            }
-
-            if serial_buf[2] != 0x77 {
-                eprintln!("Invalid data length. Expected 0x77 (119), got {:#x}", serial_buf[2]);
-                return engine_data;
-            }
-
-            println!("Valid header received: {:#x} {:#x} {:#x}", 
-                    serial_buf[0], serial_buf[1], serial_buf[2]);
-
-        }
-        Err(e) => {
-            eprintln!("Failed to read response header: {:?}", e);
-            return engine_data;
-        }
+    // Send single 'A' byte
+    if let Err(e) = port.write_all(&[b'A']) {
+        eprintln!("Error sending command: {:?}", e);
+        return engine_data;
     }
 
-    // Read the data payload (119 bytes)
-    let mut data_buf = vec![0u8; 119];
-    match port.read_exact(&mut data_buf) {
+    // Wait for processing
+    thread::sleep(Duration::from_millis(100));
+
+    // Read exact number of bytes
+    let mut buffer = vec![0u8; 120];
+    match port.read_exact(&mut buffer) {
         Ok(_) => {
-            engine_data.extend_from_slice(&data_buf);
+            engine_data.extend_from_slice(&buffer);
         }
         Err(e) => {
-            eprintln!("Failed to read data payload: {:?}", e);
+            eprintln!("Failed to read data: {:?}", e);
         }
     }
 
