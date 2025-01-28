@@ -5,50 +5,94 @@ use std::sync::Arc;
 /// Represents the Speeduino ECU data structure.
 #[derive(Debug)]
 struct SpeeduinoData {
-    secl: u8,                  // Counter for +1s
-    status1: u8,               // Status byte 1
-    engine: u8,                // Engine status
-    dwell: u8,                 // Dwell time
-    map_low: u8,               // Low byte of MAP sensor reading
-    map_high: u8,              // High byte of MAP sensor reading
-    mat: u8,                   // Manifold Air Temperature sensor reading
-    coolant_adc: u8,           // Coolant Analog-to-Digital Conversion value
-    bat_correction: u8,        // Battery correction
-    battery_10: u8,            // Battery voltage * 10
-    o2_primary: u8,            // Primary O2 sensor reading
-    ego_correction: u8,        // EGO Correction
-    iat_correction: u8,        // IAT Correction
-    wue_correction: u8,        // Warm-Up Enrichment Correction
-    rpm_low: u8,               // Low byte of RPM
-    rpm_high: u8,              // High byte of RPM
-    tae_amount: u8,            // TAE Amount
-    corrections: u8,           // Corrections
-    ve: u8,                    // Volumetric Efficiency
-    afr_target: u8,            // AFR Target
-    pw1_low: u8,               // Low byte of Pulse Width 1
-    pw1_high: u8,              // High byte of Pulse Width 1
-    tps_dot: u8,               // Throttle Position Sensor change per second
-    advance: u8,               // Ignition Advance
-    tps: u8,                   // Throttle Position Sensor reading
-    loops_per_second_low: u8,  // Low byte of loops per second
-    loops_per_second_high: u8, // High byte of loops per second
-    free_ram_low: u8,          // Low byte of free RAM
-    free_ram_high: u8,         // High byte of free RAM
-    boost_target: u8,          // Boost Target
-    boost_duty: u8,            // Boost Duty
-    spark: u8,                 // Spark
-    rpm_dot_low: u8,           // Low byte of RPM DOT (assuming signed integer)
-    rpm_dot_high: u8,          // High byte of RPM DOT (assuming signed integer)
-    ethanol_pct: u8,           // Ethanol Percentage
-    flex_correction: u8,       // Flex Fuel Correction
-    flex_ign_correction: u8,   // Flex Fuel Ignition Correction
-    idle_load: u8,             // Idle Load
-    test_outputs: u8,          // Test Outputs
-    o2_secondary: u8,          // Secondary O2 sensor reading
-    baro: u8,                  // Barometric Pressure
-    canin: [u8; 16],           // CAN Input values
-    tps_adc: u8,               // Throttle Position Sensor ADC value
-    next_error: u8,            // Next Error
+    secl: u8,                       // Counter for +1s
+    status1: u8,                    // Status byte 1
+    engine: u8,                     // Engine status
+    dwell: u8,                      // Dwell time
+    map_low: u8,                    // Low byte of MAP sensor reading
+    map_high: u8,                   // High byte of MAP sensor reading
+    mat: u8,                        // Manifold Air Temperature sensor reading
+    coolant_adc: u8,                // Coolant Analog-to-Digital Conversion value
+    bat_correction: u8,             // Battery correction
+    battery_10: u8,                 // Battery voltage * 10
+    o2_primary: u8,                 // Primary O2 sensor reading
+    ego_correction: u8,             // EGO Correction
+    iat_correction: u8,             // IAT Correction
+    wue_correction: u8,             // Warm-Up Enrichment Correction
+    rpm_low: u8,                    // Low byte of RPM
+    rpm_high: u8,                   // High byte of RPM
+    tae_amount: u8,                 // TAE Amount
+    corrections: u8,                // Corrections
+    ve: u8,                         // Volumetric Efficiency
+    afr_target: u8,                 // AFR Target
+    pw1_low: u8,                    // Low byte of Pulse Width 1
+    pw1_high: u8,                   // High byte of Pulse Width 1
+    tps_dot: u8,                    // Throttle Position Sensor change per second
+    advance: u8,                    // Ignition Advance
+    tps: u8,                        // Throttle Position Sensor reading
+    loops_per_second_low: u8,       // Low byte of loops per second
+    loops_per_second_high: u8,      // High byte of loops per second
+    free_ram_low: u8,               // Low byte of free RAM
+    free_ram_high: u8,              // High byte of free RAM
+    boost_target: u8,               // Boost Target
+    boost_duty: u8,                 // Boost Duty
+    spark: u8,                      // Spark
+    rpm_dot_low: u8,                // Low byte of RPM DOT (assuming signed integer)
+    rpm_dot_high: u8,               // High byte of RPM DOT (assuming signed integer)
+    ethanol_pct: u8,                // Ethanol Percentage
+    flex_correction: u8,            // Flex Fuel Correction
+    flex_ign_correction: u8,        // Flex Fuel Ignition Correction
+    idle_load: u8,                  // Idle Load
+    test_outputs: u8,               // Test Outputs
+    o2_secondary: u8,               // Secondary O2 sensor reading
+    baro: u8,                       // Barometric Pressure
+    canin: [u8; 16],                // CAN Input values
+    tps_adc: u8,                    // Throttle Position Sensor ADC value
+    next_error: u8,                 // Next Error
+    launch_correction: u8,          // Launch control correction
+    pw2_low: u8,                    // Low byte of Pulse Width 2
+    pw2_high: u8,                   // High byte of Pulse Width 2
+    pw3_low: u8,                    // Low byte of Pulse Width 3
+    pw3_high: u8,                   // High byte of Pulse Width 3
+    pw4_low: u8,                    // Low byte of Pulse Width 4
+    pw4_high: u8,                   // High byte of Pulse Width 4
+    status3: u8,                    // Status3 bitfield
+    engine_protect_status: u8,      // Engine protection status
+    fuel_load_low: u8,              // Low byte of fuel load
+    fuel_load_high: u8,             // High byte of fuel load
+    ign_load_low: u8,               // Low byte of ignition load
+    ign_load_high: u8,              // High byte of ignition load
+    inj_angle_low: u8,              // Low byte of injection angle
+    inj_angle_high: u8,             // High byte of injection angle
+    idle_duty: u8,                  // Idle duty cycle
+    cl_idle_target: u8,             // Closed loop idle target
+    map_dot: u8,                    // MAP rate of change
+    vvt1_angle: i8,                 // VVT1 angle
+    vvt1_target_angle: u8,          // VVT1 target angle
+    vvt1_duty: u8,                  // VVT1 duty cycle
+    flex_boost_correction_low: u8,  // Low byte of flex boost correction
+    flex_boost_correction_high: u8, // High byte of flex boost correction
+    baro_correction: u8,            // Barometric pressure correction
+    ase_value: u8,                  // Current ASE value
+    vss_low: u8,                    // Low byte of vehicle speed
+    vss_high: u8,                   // High byte of vehicle speed
+    gear: u8,                       // Current gear
+    fuel_pressure: u8,              // Fuel pressure
+    oil_pressure: u8,               // Oil pressure
+    wmi_pw: u8,                     // Water-methanol injection pulse width
+    status4: u8,                    // Status4 bitfield
+    vvt2_angle: i8,                 // VVT2 angle
+    vvt2_target_angle: u8,          // VVT2 target angle
+    vvt2_duty: u8,                  // VVT2 duty cycle
+    outputs_status: u8,             // Outputs status
+    fuel_temp: u8,                  // Fuel temperature
+    fuel_temp_correction: u8,       // Fuel temperature correction
+    ve1: u8,                        // VE table 1 value
+    ve2: u8,                        // VE table 2 value
+    advance1: u8,                   // Advance table 1 value
+    advance2: u8,                   // Advance table 2 value
+    nitrous_status: u8,             // Nitrous system status
+    ts_sd_status: u8,               // SD card status
 }
 
 /// Process and print the received Speeduino ECU data
@@ -201,6 +245,50 @@ fn parse_realtime_data(data: &[u8]) -> SpeeduinoData {
         ],
         tps_adc: read_byte(data, &mut offset),
         next_error: read_byte(data, &mut offset),
+        launch_correction: read_byte(data, &mut offset),
+        pw2_low: read_byte(data, &mut offset),
+        pw2_high: read_byte(data, &mut offset),
+        pw3_low: read_byte(data, &mut offset),
+        pw3_high: read_byte(data, &mut offset),
+        pw4_low: read_byte(data, &mut offset),
+        pw4_high: read_byte(data, &mut offset),
+        status3: read_byte(data, &mut offset),
+        engine_protect_status: read_byte(data, &mut offset),
+        fuel_load_low: read_byte(data, &mut offset),
+        fuel_load_high: read_byte(data, &mut offset),
+        ign_load_low: read_byte(data, &mut offset),
+        ign_load_high: read_byte(data, &mut offset),
+        inj_angle_low: read_byte(data, &mut offset),
+        inj_angle_high: read_byte(data, &mut offset),
+        idle_duty: read_byte(data, &mut offset),
+        cl_idle_target: read_byte(data, &mut offset),
+        map_dot: read_byte(data, &mut offset),
+        vvt1_angle: read_byte(data, &mut offset) as i8,
+        vvt1_target_angle: read_byte(data, &mut offset),
+        vvt1_duty: read_byte(data, &mut offset),
+        flex_boost_correction_low: read_byte(data, &mut offset),
+        flex_boost_correction_high: read_byte(data, &mut offset),
+        baro_correction: read_byte(data, &mut offset),
+        ase_value: read_byte(data, &mut offset),
+        vss_low: read_byte(data, &mut offset),
+        vss_high: read_byte(data, &mut offset),
+        gear: read_byte(data, &mut offset),
+        fuel_pressure: read_byte(data, &mut offset),
+        oil_pressure: read_byte(data, &mut offset),
+        wmi_pw: read_byte(data, &mut offset),
+        status4: read_byte(data, &mut offset),
+        vvt2_angle: read_byte(data, &mut offset) as i8,
+        vvt2_target_angle: read_byte(data, &mut offset),
+        vvt2_duty: read_byte(data, &mut offset),
+        outputs_status: read_byte(data, &mut offset),
+        fuel_temp: read_byte(data, &mut offset),
+        fuel_temp_correction: read_byte(data, &mut offset),
+        ve1: read_byte(data, &mut offset),
+        ve2: read_byte(data, &mut offset),
+        advance1: read_byte(data, &mut offset),
+        advance2: read_byte(data, &mut offset),
+        nitrous_status: read_byte(data, &mut offset),
+        ts_sd_status: read_byte(data, &mut offset),
     }
 }
 
@@ -324,6 +412,70 @@ fn get_params_to_publish(speeduino_data: &SpeeduinoData) -> Vec<(&str, String)> 
         ("EGC", speeduino_data.ego_correction.to_string()),
         ("WEC", speeduino_data.wue_correction.to_string()),
         ("SCL", speeduino_data.secl.to_string()),
+        ("LNC", speeduino_data.launch_correction.to_string()),
+        (
+            "PW2",
+            combine_bytes(speeduino_data.pw2_high, speeduino_data.pw2_low).to_string(),
+        ),
+        (
+            "PW3",
+            combine_bytes(speeduino_data.pw3_high, speeduino_data.pw3_low).to_string(),
+        ),
+        (
+            "PW4",
+            combine_bytes(speeduino_data.pw4_high, speeduino_data.pw4_low).to_string(),
+        ),
+        ("ST3", speeduino_data.status3.to_string()),
+        ("EPS", speeduino_data.engine_protect_status.to_string()),
+        (
+            "FLD",
+            combine_bytes(speeduino_data.fuel_load_high, speeduino_data.fuel_load_low).to_string(),
+        ),
+        (
+            "IGD",
+            combine_bytes(speeduino_data.ign_load_high, speeduino_data.ign_load_low).to_string(),
+        ),
+        (
+            "INA",
+            combine_bytes(speeduino_data.inj_angle_high, speeduino_data.inj_angle_low).to_string(),
+        ),
+        ("IDY", speeduino_data.idle_duty.to_string()),
+        ("CLT", speeduino_data.cl_idle_target.to_string()),
+        ("MPD", speeduino_data.map_dot.to_string()),
+        ("VA1", speeduino_data.vvt1_angle.to_string()),
+        ("VT1", speeduino_data.vvt1_target_angle.to_string()),
+        ("VD1", speeduino_data.vvt1_duty.to_string()),
+        (
+            "FBC",
+            combine_bytes(
+                speeduino_data.flex_boost_correction_high,
+                speeduino_data.flex_boost_correction_low,
+            )
+            .to_string(),
+        ),
+        ("BRC", speeduino_data.baro_correction.to_string()),
+        ("ASE", speeduino_data.ase_value.to_string()),
+        (
+            "VSS",
+            combine_bytes(speeduino_data.vss_high, speeduino_data.vss_low).to_string(),
+        ),
+        ("GER", speeduino_data.gear.to_string()),
+        ("FPR", speeduino_data.fuel_pressure.to_string()),
+        ("OPR", speeduino_data.oil_pressure.to_string()),
+        ("WMI", speeduino_data.wmi_pw.to_string()),
+        ("ST4", speeduino_data.status4.to_string()),
+        ("VA2", speeduino_data.vvt2_angle.to_string()),
+        ("VT2", speeduino_data.vvt2_target_angle.to_string()),
+        ("VD2", speeduino_data.vvt2_duty.to_string()),
+        ("OUT", speeduino_data.outputs_status.to_string()),
+        ("FTP", (speeduino_data.fuel_temp as i16 - 40).to_string()), // Apply temperature offset
+        ("FTC", speeduino_data.fuel_temp_correction.to_string()),
+        ("VE1", speeduino_data.ve1.to_string()),
+        ("VE2", speeduino_data.ve2.to_string()),
+        ("AD1", speeduino_data.advance1.to_string()),
+        ("AD2", speeduino_data.advance2.to_string()),
+        ("NOS", speeduino_data.nitrous_status.to_string()),
+        ("SDS", speeduino_data.ts_sd_status.to_string()),
     ]
 }
 

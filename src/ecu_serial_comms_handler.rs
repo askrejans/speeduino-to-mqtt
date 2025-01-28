@@ -17,7 +17,7 @@ lazy_static! {
     );
 
     /// Length of the engine data message.
-    static ref ENGINE_DATA_MESSAGE_LENGTH: usize = 74; // Adjust the length based on the expected size
+    static ref ENGINE_DATA_MESSAGE_LENGTH: usize = 119; // Adjust the length based on the expected size
 }
 
 /// Set up and open a serial port based on the provided configuration.
@@ -254,38 +254,52 @@ fn handle_user_input(arc_sender: Arc<Mutex<mpsc::Sender<String>>>, should_exit: 
 ///
 /// Returns a vector containing the engine data.
 fn read_engine_data(port: &mut Box<dyn SerialPort>) -> Vec<u8> {
-    let mut serial_buf: Vec<u8> = vec![0; 512]; // Adjust buffer size as needed
+    let mut serial_buf: Vec<u8> = vec![0; 512];
     let mut engine_data: Vec<u8> = Vec::new();
 
-    // Send "A" command
-    if let Err(e) = port.write_all("A".as_bytes()) {
-        eprintln!("Error sending command to the ECU: {:?}", e);
+    // Send "n" command
+    if let Err(e) = port.write_all("n".as_bytes()) {
+        eprintln!("Error sending 'n' command to the ECU: {:?}", e);
         return engine_data;
     }
 
-    // Read available data from the serial port
-    loop {
-        match port.read(serial_buf.as_mut_slice()) {
-            Ok(t) if t > 0 => {
-                engine_data.extend_from_slice(&serial_buf[..t]);
+    // Read response header with timeout
+    match port.read_exact(&mut serial_buf[0..3]) {
+        Ok(_) => {
+            // Verify response header bytes
+            if serial_buf[0] != 0x6E {
+                eprintln!("Invalid response header from ECU. Expected 0x6E, got {:#x}", serial_buf[0]);
+                return engine_data;
+            }
 
-                // Check if the engine data message is complete
-                if engine_data.len() >= *ENGINE_DATA_MESSAGE_LENGTH {
-                    break;
-                }
+            if serial_buf[1] != 0x32 {
+                eprintln!("Invalid command type. Expected 0x32, got {:#x}", serial_buf[1]);
+                return engine_data;
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                eprintln!("Read timed out");
-                break;
+
+            if serial_buf[2] != 0x77 {
+                eprintln!("Invalid data length. Expected 0x77 (119), got {:#x}", serial_buf[2]);
+                return engine_data;
             }
-            Err(e) => {
-                eprintln!("Error reading from serial port: {:?}", e);
-                break;
-            }
-            Ok(_) => {
-                // No data read, continue the loop
-                continue;
-            }
+
+            println!("Valid header received: {:#x} {:#x} {:#x}", 
+                    serial_buf[0], serial_buf[1], serial_buf[2]);
+
+        }
+        Err(e) => {
+            eprintln!("Failed to read response header: {:?}", e);
+            return engine_data;
+        }
+    }
+
+    // Read the data payload (119 bytes)
+    let mut data_buf = vec![0u8; 119];
+    match port.read_exact(&mut data_buf) {
+        Ok(_) => {
+            engine_data.extend_from_slice(&data_buf);
+        }
+        Err(e) => {
+            eprintln!("Failed to read data payload: {:?}", e);
         }
     }
 
