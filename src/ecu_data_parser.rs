@@ -204,9 +204,9 @@ fn validate_data(data: &SpeeduinoData) -> Result<()> {
         warn!("TPS out of range: {}% (max: {})", data.tps, TPS_MAX);
     }
     
-    // Validate battery voltage
+    // Validate battery voltage (allow 0V for disconnected battery)
     let battery_voltage = data.battery_10 as f32 / 10.0;
-    if battery_voltage < BATTERY_MIN || battery_voltage > BATTERY_MAX {
+    if battery_voltage > 0.0 && (battery_voltage < BATTERY_MIN || battery_voltage > BATTERY_MAX) {
         warn!("Battery voltage out of range: {}V (range: {} to {})", 
               battery_voltage, BATTERY_MIN, BATTERY_MAX);
     }
@@ -741,6 +741,16 @@ mod tests {
         data.battery_10 = 70; // 7.0V (too low)
         
         // Should still succeed but log a warning
+        let result = validate_data(&data);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_data_battery_zero_allowed() {
+        let mut data = create_test_data();
+        data.battery_10 = 0; // 0.0V (disconnected battery - should be allowed)
+        
+        // Should succeed without warning
         let result = validate_data(&data);
         assert!(result.is_ok());
     }
