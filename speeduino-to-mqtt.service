@@ -1,0 +1,67 @@
+[Unit]
+Description=Speeduino ECU to MQTT Bridge
+Documentation=https://github.com/askrejans/speeduino-to-mqtt
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=speeduino
+Group=speeduino
+
+# Path to the binary
+ExecStart=/usr/local/bin/speeduino-to-mqtt --config /etc/speeduino-to-mqtt/settings.toml
+
+# Working directory
+WorkingDirectory=/var/lib/speeduino-to-mqtt
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Resource limits
+MemoryLimit=256M
+CPUQuota=50%
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/speeduino-to-mqtt
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# Device access - allow serial port
+DevicePolicy=closed
+# Uncomment and adjust the serial device path as needed:
+DeviceAllow=/dev/ttyACM0 rw
+# DeviceAllow=/dev/ttyUSB0 rw
+
+# Capabilities
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# System call filtering
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+SystemCallErrorNumber=EPERM
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=speeduino-to-mqtt
+
+# Environment variables (optional - can also use settings.toml)
+# Environment="SPEEDUINO_LOG_LEVEL=info"
+# Environment="SPEEDUINO_MQTT_HOST=mqtt.local"
+
+[Install]
+WantedBy=multi-user.target

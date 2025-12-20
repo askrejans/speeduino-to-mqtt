@@ -1,19 +1,158 @@
-# settings.toml
+# ========================================
+# Speeduino-to-MQTT Configuration File
+# ========================================
+#
+# This file contains all configuration options for the Speeduino-to-MQTT application.
+# All values shown are the defaults. Uncomment and modify as needed.
+#
+# NOTE: All settings can be overridden with environment variables using the prefix SPEEDUINO_
+# Example: SPEEDUINO_PORT_NAME=/dev/ttyUSB0 SPEEDUINO_MQTT_HOST=broker.local
 
-# The serial port name or path. Adjust this based on your system configuration.
+# ========================================
+# Serial Port Configuration
+# ========================================
+
+# The serial port device path (Linux/macOS) or COM port (Windows)
+# Examples: "/dev/ttyACM0", "/dev/ttyUSB0", "COM3"
 port_name = "/dev/ttyACM0"
 
-# Baud rate for serial communication with the device.
+# Baud rate for serial communication with Speeduino ECU
+# Valid values: 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600
+# Most Speeduino setups use 115200
 baud_rate = 115200
 
-# MQTT broker host address. Change to the appropriate host where your MQTT broker is running.
+# Expected data packet length from ECU in bytes
+# Default: 120 (Speeduino realtime data packet size)
+# expected_data_length = 120
+
+# Serial read timeout in milliseconds
+# read_timeout_ms = 2000
+
+# ========================================
+# MQTT Broker Configuration
+# ========================================
+
+# MQTT broker host address
+# Can be IP address or hostname
 mqtt_host = "localhost"
 
-# MQTT broker port number.
+# MQTT broker port
+# Standard ports: 1883 (unencrypted), 8883 (TLS/SSL)
 mqtt_port = 1883
 
-# Base MQTT topic for communication. Customize based on your project or device.
+# Base MQTT topic prefix for all published data
+# All sensor topics will be published under this prefix
+# Example: "/GOLF86/ECU/" results in topics like "/GOLF86/ECU/RPM"
 mqtt_base_topic = "/GOLF86/ECU/"
 
-# Refresh rate in milliseconds for data updates or transmissions.
+# MQTT Quality of Service level
+# 0 = At most once (fire and forget)
+# 1 = At least once (acknowledged delivery) - RECOMMENDED
+# 2 = Exactly once (guaranteed single delivery)
+# mqtt_qos = 1
+
+# MQTT Client ID (optional - auto-generated if not specified)
+# mqtt_client_id = "speeduino-to-mqtt-12345"
+
+# ========================================
+# MQTT Authentication (Optional)
+# ========================================
+
+# Uncomment to enable MQTT authentication
+# mqtt_username = "your_username"
+# mqtt_password = "your_password"
+
+# ========================================
+# MQTT TLS/SSL Configuration (Optional)
+# ========================================
+
+# Enable TLS/SSL encrypted connection
+# Set to true and configure certificate paths below
+# mqtt_use_tls = false
+
+# Path to CA certificate for server verification
+# mqtt_ca_cert_path = "/path/to/ca.crt"
+
+# Path to client certificate (for mutual TLS)
+# mqtt_client_cert_path = "/path/to/client.crt"
+
+# Path to client private key (for mutual TLS)
+# mqtt_client_key_path = "/path/to/client.key"
+
+# ========================================
+# Application Behavior
+# ========================================
+
+# ECU data polling interval in milliseconds
+# Lower values = more frequent updates but higher CPU/network usage
+# Recommended: 20-100ms depending on your use case
+# Valid range: 1-10000ms
 refresh_rate_ms = 20
+
+# Maximum number of reconnection attempts
+# After this many failed attempts, the application will exit
+# max_retry_count = 10
+
+# Initial reconnection delay in milliseconds
+# Used for exponential backoff calculation
+# initial_retry_delay_ms = 1000
+
+# Maximum reconnection delay in milliseconds
+# Caps the exponential backoff to prevent excessive wait times
+# max_retry_delay_ms = 60000
+
+# MQTT message buffer size (number of messages)
+# Messages are queued if broker is temporarily unavailable
+# message_buffer_size = 1000
+
+# ========================================
+# Logging Configuration
+# ========================================
+
+# Log level: trace, debug, info, warn, error
+# - trace: Very verbose, shows all internal operations
+# - debug: Detailed information for troubleshooting
+# - info: General informational messages (recommended for production)
+# - warn: Warning messages only
+# - error: Error messages only
+log_level = "info"
+
+# Enable JSON formatted logs (useful for log aggregation systems)
+# log_json = false
+
+# ========================================
+# Example Configurations
+# ========================================
+
+# --- Development/Testing Setup ---
+# port_name = "/dev/ttyACM0"
+# baud_rate = 115200
+# mqtt_host = "localhost"
+# mqtt_port = 1883
+# refresh_rate_ms = 100
+# log_level = "debug"
+
+# --- Production Setup with Authentication ---
+# port_name = "/dev/ttyACM0"
+# baud_rate = 115200
+# mqtt_host = "mqtt.example.com"
+# mqtt_port = 1883
+# mqtt_username = "speeduino_client"
+# mqtt_password = "secure_password_here"
+# refresh_rate_ms = 20
+# log_level = "info"
+# log_json = true
+
+# --- Production Setup with TLS ---
+# port_name = "/dev/ttyACM0"
+# baud_rate = 115200
+# mqtt_host = "mqtt.example.com"
+# mqtt_port = 8883
+# mqtt_use_tls = true
+# mqtt_ca_cert_path = "/etc/ssl/certs/ca.crt"
+# mqtt_username = "speeduino_client"
+# mqtt_password = "secure_password_here"
+# refresh_rate_ms = 20
+# log_level = "info"
+# message_buffer_size = 5000
+
