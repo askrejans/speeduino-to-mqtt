@@ -15,11 +15,6 @@ use tracing::{debug, error, info, warn};
 /// ECU command to request realtime data
 const ECU_COMMAND: u8 = b'A';
 
-/// Sleep before clearing the input buffer so that all bytes from the previous
-/// ECU response have had time to arrive in the OS buffer. At 115200 baud,
-/// 138 bytes take ~12 ms to transmit. 25 ms gives plenty of margin.
-const PRE_CLEAR_SLEEP_MS: u64 = 25;
-
 /// Minimum bytes required for a valid primary-serial packet.
 /// Matches the parser's MIN_BYTES constant (130 = sim / real firmware minimum).
 const MIN_PACKET_BYTES: usize = 130;
@@ -83,12 +78,9 @@ impl EcuSerialHandler {
         let conn = self.connection.as_mut().ok_or(SerialError::Disconnected)?;
 
         // ── Pre-clear ─────────────────────────────────────────────────────────
-        // Sleep first so all bytes from the previous ECU response have had time
-        // to arrive in the OS receive buffer, then clear it in one atomic syscall.
-        // For serial ports clear_buffers() calls serialport::clear(All) — instant
-        // kernel-level purge of the UART FIFO, far more reliable than async reads.
-        // For TCP (WiFi bridges) it is a no-op.
-        sleep(Duration::from_millis(PRE_CLEAR_SLEEP_MS)).await;
+        // Flush the OS receive buffer before sending the command so no stale
+        // bytes from a previous cycle corrupt this read. clear_buffers() is an
+        // instant kernel-level UART FIFO purge — no sleep needed.
         conn.clear_buffers().ok();
 
         // ── Send command ──────────────────────────────────────────────────────
