@@ -15,8 +15,21 @@ use tracing::{debug, error, info, warn};
 /// ECU command to request realtime data
 const ECU_COMMAND: u8 = b'A';
 
-/// Delay after sending command before reading response
-const COMMAND_PROCESSING_DELAY_MS: u64 = 50;
+/// Sleep before clearing the input buffer so that all bytes from the previous
+/// ECU response have had time to arrive in the OS buffer. At 115200 baud,
+/// 138 bytes take ~12 ms to transmit. 25 ms gives plenty of margin.
+const PRE_CLEAR_SLEEP_MS: u64 = 25;
+
+/// Minimum bytes required for a valid primary-serial packet.
+/// Matches the parser's MIN_BYTES constant (130 = sim / real firmware minimum).
+const MIN_PACKET_BYTES: usize = 130;
+
+/// Maximum response buffer size – larger than any known Speeduino packet.
+const MAX_PACKET_BYTES: usize = 256;
+
+/// After reading MIN_PACKET_BYTES, drain any remaining bytes (e.g. the 8 extra
+/// bytes that real 138-byte firmware sends beyond our read_exact window).
+const POST_DRAIN_IDLE_MS: u64 = 10;
 
 /// ECU connection handler — supports hardware serial and TCP (e.g. WiFi bridge).
 pub struct EcuSerialHandler {
@@ -69,45 +82,69 @@ impl EcuSerialHandler {
     pub async fn read_engine_data(&mut self) -> Result<Vec<u8>> {
         let conn = self.connection.as_mut().ok_or(SerialError::Disconnected)?;
 
-        // Clear serial buffers (no-op for TCP)
+        // ── Pre-clear ─────────────────────────────────────────────────────────
+        // Sleep first so all bytes from the previous ECU response have had time
+        // to arrive in the OS receive buffer, then clear it in one atomic syscall.
+        // For serial ports clear_buffers() calls serialport::clear(All) — instant
+        // kernel-level purge of the UART FIFO, far more reliable than async reads.
+        // For TCP (WiFi bridges) it is a no-op.
+        sleep(Duration::from_millis(PRE_CLEAR_SLEEP_MS)).await;
         conn.clear_buffers().ok();
 
-        // Send command
+        // ── Send command ──────────────────────────────────────────────────────
         debug!("Sending ECU command: 0x{:02X}", ECU_COMMAND);
         conn.write_all(&[ECU_COMMAND])
             .await
             .map_err(SerialError::WriteFailed)?;
-
         conn.flush().await.map_err(SerialError::WriteFailed)?;
 
-        // Wait for ECU to process command
-        sleep(Duration::from_millis(COMMAND_PROCESSING_DELAY_MS)).await;
-
-        // Read expected data length with timeout
-        let mut buffer = vec![0u8; self.config.expected_data_length];
-
+        // ── Read exactly MIN_PACKET_BYTES ─────────────────────────────────────
+        // read_exact blocks until every byte arrives — no idle-detection
+        // ambiguity. The buffer was just cleared, so these bytes can only be
+        // from our command.
+        let mut buffer = vec![0u8; MIN_PACKET_BYTES];
         match timeout(
             Duration::from_millis(self.config.read_timeout_ms),
             conn.read_exact(&mut buffer),
         )
         .await
         {
-            Ok(Ok(_)) => {
-                debug!("Successfully read {} bytes from ECU", buffer.len());
-                Ok(buffer)
-            }
+            Ok(Ok(_)) => {}
             Ok(Err(e)) => {
                 error!("Failed to read from serial port: {}", e);
-                Err(SerialError::ReadFailed(e).into())
+                return Err(SerialError::ReadFailed(e).into());
             }
             Err(_) => {
                 error!("Read timeout after {}ms", self.config.read_timeout_ms);
-                Err(SerialError::ReadTimeout {
+                return Err(SerialError::ReadTimeout {
                     timeout_ms: self.config.read_timeout_ms,
                 }
-                .into())
+                .into());
             }
         }
+
+        // ── Post-drain ────────────────────────────────────────────────────────
+        // Real firmware sends 138 bytes; we consumed 130. Collect the remaining
+        // bytes (if any) so they don't pollute the next cycle's clear.
+        // Append them so the parser can use the fuller packet (PW5-PW8 etc.).
+        let mut tmp = [0u8; 64];
+        let mut extra: Vec<u8> = Vec::new();
+        loop {
+            match timeout(Duration::from_millis(POST_DRAIN_IDLE_MS), conn.read(&mut tmp)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    debug!("Post-drain: collected {} extra bytes", n);
+                    if extra.len() + n <= MAX_PACKET_BYTES - MIN_PACKET_BYTES {
+                        extra.extend_from_slice(&tmp[..n]);
+                    }
+                }
+                Ok(Err(_)) => break,
+            }
+        }
+        buffer.extend_from_slice(&extra);
+
+        debug!("Received {} bytes from ECU", buffer.len());
+        Ok(buffer)
     }
 
     /// Attempt to reconnect with exponential backoff
