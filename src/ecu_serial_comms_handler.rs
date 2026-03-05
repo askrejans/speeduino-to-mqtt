@@ -93,22 +93,28 @@ impl EcuSerialHandler {
         sleep(Duration::from_millis(COMMAND_PROCESSING_DELAY_MS)).await;
 
         // ── Drain whatever is in the OS buffer ────────────────────────────────
-        // All bytes have already arrived during the sleep above.  Use a 5 ms
-        // per-read deadline so each call returns almost immediately rather than
-        // blocking.  Stop when no more data is available or the buffer is full.
+        // For serial: all bytes arrived during the sleep above, so every read()
+        // returns immediately.  For TCP: the first read() uses the full deadline
+        // in case the response is still in-flight (TCP has no UART buffer
+        // guarantee).  Subsequent reads use 5 ms to drain any remaining bytes
+        // without blocking once the bus goes idle.
         let mut buffer: Vec<u8> = Vec::with_capacity(MAX_PACKET_BYTES);
+        let first_deadline = Duration::from_millis(self.config.read_timeout_ms);
+        let mut first_read = true;
         loop {
+            let per_read_timeout = if first_read { first_deadline } else { Duration::from_millis(5) };
             let mut tmp = [0u8; 64];
-            match timeout(Duration::from_millis(5), conn.read(&mut tmp)).await {
+            match timeout(per_read_timeout, conn.read(&mut tmp)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
+                    first_read = false;
                     buffer.extend_from_slice(&tmp[..n]);
                     if buffer.len() >= MAX_PACKET_BYTES {
                         break;
                     }
                 }
                 Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
-                Err(_) => break, // 5 ms elapsed with no more bytes — buffer drained
+                Err(_) => break, // idle — buffer fully drained
             }
         }
 

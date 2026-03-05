@@ -1871,7 +1871,7 @@ dependencies = [
 
 [[package]]
 name = "speeduino-to-mqtt"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "atty",
