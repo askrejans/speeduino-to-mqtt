@@ -212,11 +212,11 @@ async fn ecu_communication_loop(
             Err(e) => {
                 error!("Failed to read from ECU: {}", e);
                 consecutive_errors += 1;
-                handler.disconnect().await;
                 tui_state.write().await.ecu_connected = false;
 
                 if consecutive_errors >= MAX_ERRORS {
                     error!("Too many read errors, reconnecting…");
+                    handler.disconnect().await;
                     match handler.reconnect().await {
                         Ok(_) => {
                             consecutive_errors = 0;
