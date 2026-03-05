@@ -25,6 +25,10 @@ const PRE_DRAIN_IDLE_MS: u64 = 20;
 /// Only applied once MIN_PACKET_BYTES have been received.
 /// 30 ms >> 138-byte transmission time (~12 ms at 115200 baud).
 const IDLE_DONE_MS: u64 = 30;
+/// How many times to retry send+collect within a single read_engine_data call
+/// before giving up and returning an error.  Handles the occasional short /
+/// mis-aligned packet without triggering a full reconnect.
+const MAX_READ_RETRIES: u32 = 3;
 
 /// ECU connection handler — supports hardware serial and TCP (e.g. WiFi bridge).
 pub struct EcuSerialHandler {
@@ -75,84 +79,90 @@ impl EcuSerialHandler {
     ///
     /// Strategy (no sleep, no kernel buffer flush — safe on Linux USB-serial):
     ///   1. Pre-drain: read & discard until PRE_DRAIN_IDLE_MS of silence.
-    ///      Clears any bytes left over from a previous cycle.
     ///   2. Send `A` + flush.
-    ///   3. Collect: keep reading into a buffer.  Once MIN_PACKET_BYTES have
-    ///      arrived, switch to a short IDLE_DONE_MS timeout.  Stop when that
-    ///      timeout fires (bus quiet — full response received) or the overall
-    ///      deadline is hit.
+    ///   3. Collect: keep reading.  Once MIN_PACKET_BYTES have arrived,
+    ///      switch to IDLE_DONE_MS idle timeout to detect end-of-packet.
+    ///   4. If the resulting packet is too short, drain + retry the whole
+    ///      send→collect up to MAX_READ_RETRIES times before returning an
+    ///      error.  This recovers from a single mis-aligned or truncated read
+    ///      without triggering a full reconnect.
     pub async fn read_engine_data(&mut self) -> Result<Vec<u8>> {
         let conn = self.connection.as_mut().ok_or(SerialError::Disconnected)?;
 
-        // ── 1. Pre-drain ───────────────────────────────────────────────────
-        // Discard bytes that arrived since the last cycle.
-        {
-            let mut drain = [0u8; 64];
-            loop {
-                match timeout(
-                    Duration::from_millis(PRE_DRAIN_IDLE_MS),
-                    conn.read(&mut drain),
-                )
+        // ── Initial pre-drain ───────────────────────────────────────────────
+        Self::drain_until_quiet(conn, PRE_DRAIN_IDLE_MS).await;
+
+        for attempt in 0..MAX_READ_RETRIES {
+            // ── Send command ─────────────────────────────────────────────
+            debug!("Sending ECU command (attempt {})", attempt + 1);
+            conn.write_all(&[ECU_COMMAND])
                 .await
-                {
+                .map_err(SerialError::WriteFailed)?;
+            conn.flush().await.map_err(SerialError::WriteFailed)?;
+
+            // ── Collect response ───────────────────────────────────────────
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_millis(self.config.read_timeout_ms);
+            let mut buf: Vec<u8> = Vec::with_capacity(MAX_PACKET_BYTES);
+            let mut tmp = [0u8; 64];
+
+            loop {
+                let remaining =
+                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let wait = if buf.len() >= MIN_PACKET_BYTES {
+                    remaining.min(Duration::from_millis(IDLE_DONE_MS))
+                } else {
+                    remaining
+                };
+                match timeout(wait, conn.read(&mut tmp)).await {
                     Ok(Ok(0)) | Err(_) => break,
-                    Ok(Ok(_)) => {}
-                    Ok(Err(_)) => break,
-                }
-            }
-        }
-
-        // ── 2. Send command ─────────────────────────────────────────────────
-        debug!("Sending ECU command: 0x{:02X}", ECU_COMMAND);
-        conn.write_all(&[ECU_COMMAND])
-            .await
-            .map_err(SerialError::WriteFailed)?;
-        conn.flush().await.map_err(SerialError::WriteFailed)?;
-
-        // ── 3. Collect response ──────────────────────────────────────────────
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_millis(self.config.read_timeout_ms);
-        let mut buf: Vec<u8> = Vec::with_capacity(MAX_PACKET_BYTES);
-        let mut tmp = [0u8; 64];
-
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            // Before MIN bytes: wait as long as the deadline allows.
-            // After MIN bytes: use a short idle timeout to detect end-of-packet.
-            let wait = if buf.len() >= MIN_PACKET_BYTES {
-                remaining.min(Duration::from_millis(IDLE_DONE_MS))
-            } else {
-                remaining
-            };
-            match timeout(wait, conn.read(&mut tmp)).await {
-                Ok(Ok(0)) | Err(_) => break, // idle silence → end of packet (or deadline)
-                Ok(Ok(n)) => {
-                    buf.extend_from_slice(&tmp[..n]);
-                    if buf.len() >= MAX_PACKET_BYTES {
-                        break;
+                    Ok(Ok(n)) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.len() >= MAX_PACKET_BYTES {
+                            break;
+                        }
                     }
+                    Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
                 }
-                Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
             }
-        }
 
-        if buf.len() < MIN_PACKET_BYTES {
-            error!(
-                "Packet too short: {} bytes (expected ≥{})",
+            if buf.len() >= MIN_PACKET_BYTES {
+                debug!("Received {} bytes from ECU (attempt {})", buf.len(), attempt + 1);
+                return Ok(buf);
+            }
+
+            // Short / mis-aligned packet — drain and retry.
+            warn!(
+                "Short packet: {} bytes on attempt {} — draining and retrying",
                 buf.len(),
-                MIN_PACKET_BYTES
+                attempt + 1
             );
-            return Err(SerialError::ReadTimeout {
-                timeout_ms: self.config.read_timeout_ms,
-            }
-            .into());
+            Self::drain_until_quiet(conn, PRE_DRAIN_IDLE_MS).await;
         }
 
-        debug!("Received {} bytes from ECU", buf.len());
-        Ok(buf)
+        error!(
+            "All {} read attempts returned short packets",
+            MAX_READ_RETRIES
+        );
+        Err(SerialError::ReadTimeout {
+            timeout_ms: self.config.read_timeout_ms,
+        }
+        .into())
+    }
+
+    /// Discard bytes from `conn` until `idle_ms` of continuous silence.
+    async fn drain_until_quiet(conn: &mut EcuConnection, idle_ms: u64) {
+        let mut drain = [0u8; 64];
+        loop {
+            match timeout(Duration::from_millis(idle_ms), conn.read(&mut drain)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => break,
+            }
+        }
     }
 
     /// Attempt to reconnect with exponential backoff
