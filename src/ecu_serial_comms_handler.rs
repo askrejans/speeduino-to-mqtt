@@ -15,23 +15,8 @@ use tracing::{debug, error, info, warn};
 /// ECU command to request realtime data
 const ECU_COMMAND: u8 = b'A';
 
-/// At 115200 baud, 138 bytes take ~12 ms.  Wait for 50 ms of silence before
-/// sending a new command to guarantee the previous response is fully received
-/// and the bus is truly idle.
-const PRE_FLUSH_IDLE_MS: u64 = 50;
-
-/// After the command is sent, collect bytes until the bus has been silent for
-/// this long — but only once MIN_PACKET_BYTES have arrived. Before that
-/// threshold is reached we wait for the full deadline so mid-packet USB
-/// bulk-transfer gaps don't prematurely terminate the read.
-const PACKET_IDLE_MS: u64 = 30;
-
-/// Minimum bytes we must receive before treating an idle gap as end-of-packet.
-/// Matches the parser's MIN_BYTES constant (130 = sim / real firmware minimum).
-const MIN_PACKET_BYTES: usize = 130;
-
-/// Maximum response buffer size – larger than any known Speeduino packet.
-const MAX_PACKET_BYTES: usize = 256;
+/// Delay after sending command before reading response
+const COMMAND_PROCESSING_DELAY_MS: u64 = 50;
 
 /// ECU connection handler — supports hardware serial and TCP (e.g. WiFi bridge).
 pub struct EcuSerialHandler {
@@ -84,69 +69,45 @@ impl EcuSerialHandler {
     pub async fn read_engine_data(&mut self) -> Result<Vec<u8>> {
         let conn = self.connection.as_mut().ok_or(SerialError::Disconnected)?;
 
-        // ── Pre-flush: wait until the bus is genuinely idle ───────────────────
-        // Keep draining until PRE_FLUSH_IDLE_MS of silence. At 115200 baud the
-        // ECU's 138-byte response finishes in ~12 ms, so 50 ms of silence means
-        // we've consumed every byte from the previous cycle before we command again.
+        // Clear serial buffers (no-op for TCP)
         conn.clear_buffers().ok();
-        let mut tmp = [0u8; 64];
-        loop {
-            match timeout(Duration::from_millis(PRE_FLUSH_IDLE_MS), conn.read(&mut tmp)).await {
-                Ok(Ok(0)) | Err(_) => break, // bus is quiet
-                Ok(Ok(n)) => debug!("Pre-flush: discarded {} stale bytes", n),
-                Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
-            }
-        }
 
-        // ── Send command ──────────────────────────────────────────────────────
+        // Send command
         debug!("Sending ECU command: 0x{:02X}", ECU_COMMAND);
         conn.write_all(&[ECU_COMMAND])
             .await
             .map_err(SerialError::WriteFailed)?;
+
         conn.flush().await.map_err(SerialError::WriteFailed)?;
 
-        // ── Read until bus goes idle after a full packet ──────────────────────
-        // Two-phase behaviour:
-        //   • Fewer than MIN_PACKET_BYTES received → wait up to the full deadline;
-        //     a gap here is just the ECU starting to respond, or the OS USB-CDC
-        //     driver delivering bytes in 64-byte bulk-transfer chunks.
-        //   • MIN_PACKET_BYTES or more received → a PACKET_IDLE_MS gap means the
-        //     ECU has finished sending; stop and parse.
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_millis(self.config.read_timeout_ms);
-        let mut buffer: Vec<u8> = Vec::with_capacity(MAX_PACKET_BYTES);
+        // Wait for ECU to process command
+        sleep(Duration::from_millis(COMMAND_PROCESSING_DELAY_MS)).await;
 
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
+        // Read expected data length with timeout
+        let mut buffer = vec![0u8; self.config.expected_data_length];
+
+        match timeout(
+            Duration::from_millis(self.config.read_timeout_ms),
+            conn.read_exact(&mut buffer),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                debug!("Successfully read {} bytes from ECU", buffer.len());
+                Ok(buffer)
             }
-            let idle_timeout = if buffer.len() >= MIN_PACKET_BYTES {
-                remaining.min(Duration::from_millis(PACKET_IDLE_MS))
-            } else {
-                remaining
-            };
-            match timeout(idle_timeout, conn.read(&mut tmp)).await {
-                Ok(Ok(0)) => break,                              // EOF
-                Ok(Ok(n)) => {
-                    buffer.extend_from_slice(&tmp[..n]);
-                    if buffer.len() >= MAX_PACKET_BYTES { break; }
+            Ok(Err(e)) => {
+                error!("Failed to read from serial port: {}", e);
+                Err(SerialError::ReadFailed(e).into())
+            }
+            Err(_) => {
+                error!("Read timeout after {}ms", self.config.read_timeout_ms);
+                Err(SerialError::ReadTimeout {
+                    timeout_ms: self.config.read_timeout_ms,
                 }
-                Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
-                Err(_) => break,                                 // bus idle
+                .into())
             }
         }
-
-        if buffer.is_empty() {
-            error!("Read timeout after {}ms", self.config.read_timeout_ms);
-            return Err(SerialError::ReadTimeout {
-                timeout_ms: self.config.read_timeout_ms,
-            }
-            .into());
-        }
-
-        debug!("Received {} bytes from ECU", buffer.len());
-        Ok(buffer)
     }
 
     /// Attempt to reconnect with exponential backoff
