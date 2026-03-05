@@ -15,23 +15,21 @@ use tracing::{debug, error, info, warn};
 /// ECU command to request realtime data
 const ECU_COMMAND: u8 = b'A';
 
-/// At 115200 baud, 138 bytes take ~12 ms.  Wait for 50 ms of silence before
-/// sending a new command to guarantee the previous response is fully received
-/// and the bus is truly idle.
-const PRE_FLUSH_IDLE_MS: u64 = 50;
+/// Sleep before clearing the input buffer so that all bytes from the previous
+/// ECU response have had time to arrive in the OS buffer. At 115200 baud,
+/// 138 bytes take ~12 ms to transmit. 25 ms gives plenty of margin.
+const PRE_CLEAR_SLEEP_MS: u64 = 25;
 
-/// After the command is sent, collect bytes until the bus has been silent for
-/// this long — but only once MIN_PACKET_BYTES have arrived. Before that
-/// threshold is reached we wait for the full deadline so mid-packet OS
-/// buffering gaps don't prematurely terminate the read.
-const PACKET_IDLE_MS: u64 = 30;
-
-/// Minimum bytes we must receive before treating an idle gap as end-of-packet.
+/// Minimum bytes required for a valid primary-serial packet.
 /// Matches the parser's MIN_BYTES constant (130 = sim / real firmware minimum).
 const MIN_PACKET_BYTES: usize = 130;
 
 /// Maximum response buffer size – larger than any known Speeduino packet.
 const MAX_PACKET_BYTES: usize = 256;
+
+/// After reading MIN_PACKET_BYTES, drain any remaining bytes (e.g. the 8 extra
+/// bytes that real 138-byte firmware sends beyond our read_exact window).
+const POST_DRAIN_IDLE_MS: u64 = 10;
 
 /// ECU connection handler — supports hardware serial and TCP (e.g. WiFi bridge).
 pub struct EcuSerialHandler {
@@ -84,19 +82,15 @@ impl EcuSerialHandler {
     pub async fn read_engine_data(&mut self) -> Result<Vec<u8>> {
         let conn = self.connection.as_mut().ok_or(SerialError::Disconnected)?;
 
-        // ── Pre-flush: wait until the bus is genuinely idle ───────────────────
-        // Keep draining until PRE_FLUSH_IDLE_MS of silence. At 115200 baud the
-        // ECU's 138-byte response finishes in ~12 ms, so 50 ms of silence means
-        // we've consumed every byte from the previous cycle before we command again.
+        // ── Pre-clear ─────────────────────────────────────────────────────────
+        // Sleep first so all bytes from the previous ECU response have had time
+        // to arrive in the OS receive buffer, then clear it in one atomic syscall.
+        // For serial ports clear_buffers() calls serialport::clear(All) — instant
+        // kernel-level purge of the UART FIFO, far more reliable than async reads.
+        // For TCP (WiFi bridges) it is a no-op; the post-drain at the end of the
+        // previous cycle keeps TCP buffers clean.
+        sleep(Duration::from_millis(PRE_CLEAR_SLEEP_MS)).await;
         conn.clear_buffers().ok();
-        let mut tmp = [0u8; 64];
-        loop {
-            match timeout(Duration::from_millis(PRE_FLUSH_IDLE_MS), conn.read(&mut tmp)).await {
-                Ok(Ok(0)) | Err(_) => break, // bus is quiet
-                Ok(Ok(n)) => debug!("Pre-flush: discarded {} stale bytes", n),
-                Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
-            }
-        }
 
         // ── Send command ──────────────────────────────────────────────────────
         debug!("Sending ECU command: 0x{:02X}", ECU_COMMAND);
@@ -105,47 +99,51 @@ impl EcuSerialHandler {
             .map_err(SerialError::WriteFailed)?;
         conn.flush().await.map_err(SerialError::WriteFailed)?;
 
-        // ── Read until bus goes idle after a full packet ──────────────────────
-        // Two-phase behaviour:
-        //   • Fewer than MIN_PACKET_BYTES received → wait up to the full
-        //     deadline; an idle gap here is just the ECU starting to respond
-        //     or the OS delivering bytes in small chunks.
-        //   • MIN_PACKET_BYTES or more received → a PACKET_IDLE_MS gap means
-        //     the ECU has finished sending; stop collecting.
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_millis(self.config.read_timeout_ms);
-        let mut buffer: Vec<u8> = Vec::with_capacity(MAX_PACKET_BYTES);
-
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let idle_timeout = if buffer.len() >= MIN_PACKET_BYTES {
-                // Enough bytes received — a short idle means end-of-packet.
-                remaining.min(Duration::from_millis(PACKET_IDLE_MS))
-            } else {
-                // Still waiting for a full packet — don't give up on a gap.
-                remaining
-            };
-            match timeout(idle_timeout, conn.read(&mut tmp)).await {
-                Ok(Ok(0)) => break,                              // EOF
-                Ok(Ok(n)) => {
-                    buffer.extend_from_slice(&tmp[..n]);
-                    if buffer.len() >= MAX_PACKET_BYTES { break; }
+        // ── Read exactly MIN_PACKET_BYTES ─────────────────────────────────────
+        // read_exact blocks until every byte arrives — no idle-detection
+        // ambiguity.  The buffer was just cleared, so these bytes can only be
+        // from our command.
+        let mut buffer = vec![0u8; MIN_PACKET_BYTES];
+        match timeout(
+            Duration::from_millis(self.config.read_timeout_ms),
+            conn.read_exact(&mut buffer),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
+            Err(_) => {
+                error!("Read timeout after {}ms", self.config.read_timeout_ms);
+                return Err(SerialError::ReadTimeout {
+                    timeout_ms: self.config.read_timeout_ms,
                 }
-                Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
-                Err(_) => break,                                 // bus idle
+                .into());
             }
         }
 
-        if buffer.is_empty() {
-            error!("Read timeout after {}ms", self.config.read_timeout_ms);
-            return Err(SerialError::ReadTimeout {
-                timeout_ms: self.config.read_timeout_ms,
+        // ── Post-drain ────────────────────────────────────────────────────────
+        // Real firmware sends 138 bytes; we consumed 130.  Collect the remaining
+        // 8 (or however many) so they don't pollute the next cycle's clear.
+        // We use a short idle timeout — if nothing arrives within POST_DRAIN_IDLE_MS
+        // there are no extra bytes.
+        let mut extra: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 64];
+        loop {
+            match timeout(Duration::from_millis(POST_DRAIN_IDLE_MS), conn.read(&mut tmp)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    debug!("Post-drain: collected {} extra bytes", n);
+                    if extra.len() + n <= MAX_PACKET_BYTES - MIN_PACKET_BYTES {
+                        extra.extend_from_slice(&tmp[..n]);
+                    }
+                }
+                Ok(Err(_)) => break,
             }
-            .into());
         }
+
+        // Append any collected extra bytes so the parser can use the fuller packet
+        // (e.g. PW5-PW8 from the 138-byte real-firmware response).
+        buffer.extend_from_slice(&extra);
 
         debug!("Received {} bytes from ECU", buffer.len());
         Ok(buffer)
