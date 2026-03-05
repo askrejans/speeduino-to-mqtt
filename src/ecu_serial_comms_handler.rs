@@ -15,13 +15,15 @@ use tracing::{debug, error, info, warn};
 /// ECU command to request realtime data
 const ECU_COMMAND: u8 = b'A';
 
-/// Delay after sending command before reading response
-const COMMAND_PROCESSING_DELAY_MS: u64 = 50;
+/// At 115200 baud, 138 bytes take ~12 ms.  Wait for 50 ms of silence before
+/// sending a new command to guarantee the previous response is fully received
+/// and the bus is truly idle.
+const PRE_FLUSH_IDLE_MS: u64 = 50;
 
-/// Stop collecting response bytes after this many ms of bus silence.
-/// At 115200 baud, 138 bytes transmit in ~12 ms, so 20 ms comfortably
-/// catches even a slow ECU while not blocking more than one refresh cycle.
-const PACKET_IDLE_MS: u64 = 20;
+/// After the command is sent, collect bytes until the bus has been silent for
+/// this long. 30 ms > the ~12 ms needed to transmit 138 bytes, so this
+/// reliably marks end-of-packet without ever leaving trailing bytes.
+const PACKET_IDLE_MS: u64 = 30;
 
 /// Maximum response buffer size – larger than any known Speeduino packet.
 const MAX_PACKET_BYTES: usize = 256;
@@ -77,17 +79,17 @@ impl EcuSerialHandler {
     pub async fn read_engine_data(&mut self) -> Result<Vec<u8>> {
         let conn = self.connection.as_mut().ok_or(SerialError::Disconnected)?;
 
-        // ── Pre-flush: drain any stale bytes left from a previous cycle ──────
-        // clear_buffers() is a no-op for TCP, so always do a brief async drain
-        // as well.  Use a very short deadline so we don't stall the loop.
+        // ── Pre-flush: wait until the bus is genuinely idle ───────────────────
+        // Keep draining until PRE_FLUSH_IDLE_MS of silence. At 115200 baud the
+        // ECU's 138-byte response finishes in ~12 ms, so 50 ms of silence means
+        // we've consumed every byte from the previous cycle before we command again.
         conn.clear_buffers().ok();
-        {
-            let mut tmp = [0u8; 64];
-            while let Ok(Ok(n)) =
-                timeout(Duration::from_millis(5), conn.read(&mut tmp)).await
-            {
-                if n == 0 { break; }
-                debug!("Pre-flush: discarded {} stale bytes", n);
+        let mut tmp = [0u8; 64];
+        loop {
+            match timeout(Duration::from_millis(PRE_FLUSH_IDLE_MS), conn.read(&mut tmp)).await {
+                Ok(Ok(0)) | Err(_) => break, // bus is quiet
+                Ok(Ok(n)) => debug!("Pre-flush: discarded {} stale bytes", n),
+                Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
             }
         }
 
@@ -97,9 +99,6 @@ impl EcuSerialHandler {
             .await
             .map_err(SerialError::WriteFailed)?;
         conn.flush().await.map_err(SerialError::WriteFailed)?;
-
-        // Wait for ECU to begin transmitting
-        sleep(Duration::from_millis(COMMAND_PROCESSING_DELAY_MS)).await;
 
         // ── Read until bus goes idle ──────────────────────────────────────────
         // Collect bytes until no new data arrives for PACKET_IDLE_MS.
@@ -115,7 +114,6 @@ impl EcuSerialHandler {
                 break;
             }
             let idle_timeout = remaining.min(Duration::from_millis(PACKET_IDLE_MS));
-            let mut tmp = [0u8; 64];
             match timeout(idle_timeout, conn.read(&mut tmp)).await {
                 Ok(Ok(0)) => break,                              // EOF
                 Ok(Ok(n)) => {
