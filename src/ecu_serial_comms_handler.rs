@@ -15,16 +15,16 @@ use tracing::{debug, error, info, warn};
 /// ECU command to request realtime data
 const ECU_COMMAND: u8 = b'A';
 
-/// Minimum bytes we must receive to have a valid primary-serial packet.
-const MIN_PACKET_BYTES: usize = 130;
-/// Maximum buffer size — larger than any known Speeduino packet.
-const MAX_PACKET_BYTES: usize = 512;
-/// Silence (ms) we wait before sending the command, to discard stale bytes.
-const PRE_DRAIN_IDLE_MS: u64 = 20;
-/// Silence (ms) after which we consider the response complete.
-/// Only applied once MIN_PACKET_BYTES have been received.
-/// 30 ms >> 138-byte transmission time (~12 ms at 115200 baud).
-const IDLE_DONE_MS: u64 = 30;
+/// Delay after sending command before reading response
+const COMMAND_PROCESSING_DELAY_MS: u64 = 50;
+
+/// Stop collecting response bytes after this many ms of bus silence.
+/// At 115200 baud, 138 bytes transmit in ~12 ms, so 20 ms comfortably
+/// catches even a slow ECU while not blocking more than one refresh cycle.
+const PACKET_IDLE_MS: u64 = 20;
+
+/// Maximum response buffer size – larger than any known Speeduino packet.
+const MAX_PACKET_BYTES: usize = 256;
 
 /// ECU connection handler — supports hardware serial and TCP (e.g. WiFi bridge).
 pub struct EcuSerialHandler {
@@ -71,79 +71,72 @@ impl EcuSerialHandler {
         }
     }
 
-    /// Read engine data from the ECU.
+    /// Read engine data from the ECU
     ///
-    /// Strategy (no sleep, no kernel buffer flush — safe on Linux USB-serial):
-    ///   1. Pre-drain: discard bytes until PRE_DRAIN_IDLE_MS of silence.
-    ///   2. Send `A` + flush.
-    ///   3. Collect: keep reading.  Once MIN_PACKET_BYTES have arrived,
-    ///      switch to IDLE_DONE_MS idle timeout to detect end-of-packet.
-    ///
-    /// Short or garbled packets are returned as a soft error — the caller
-    /// discards them and tries again next poll cycle without reconnecting.
+    /// Sends the 'A' command and reads the expected data packet
     pub async fn read_engine_data(&mut self) -> Result<Vec<u8>> {
         let conn = self.connection.as_mut().ok_or(SerialError::Disconnected)?;
 
-        // ── 1. Pre-drain ────────────────────────────────────────────────────
-        Self::drain_until_quiet(conn, PRE_DRAIN_IDLE_MS).await;
+        // ── Pre-flush: drain any stale bytes left from a previous cycle ──────
+        // clear_buffers() is a no-op for TCP, so always do a brief async drain
+        // as well.  Use a very short deadline so we don't stall the loop.
+        conn.clear_buffers().ok();
+        {
+            let mut tmp = [0u8; 64];
+            while let Ok(Ok(n)) =
+                timeout(Duration::from_millis(5), conn.read(&mut tmp)).await
+            {
+                if n == 0 { break; }
+                debug!("Pre-flush: discarded {} stale bytes", n);
+            }
+        }
 
-        // ── 2. Send command ─────────────────────────────────────────────────
+        // ── Send command ──────────────────────────────────────────────────────
         debug!("Sending ECU command: 0x{:02X}", ECU_COMMAND);
         conn.write_all(&[ECU_COMMAND])
             .await
             .map_err(SerialError::WriteFailed)?;
         conn.flush().await.map_err(SerialError::WriteFailed)?;
 
-        // ── 3. Collect response ──────────────────────────────────────────────
+        // Wait for ECU to begin transmitting
+        sleep(Duration::from_millis(COMMAND_PROCESSING_DELAY_MS)).await;
+
+        // ── Read until bus goes idle ──────────────────────────────────────────
+        // Collect bytes until no new data arrives for PACKET_IDLE_MS.
+        // This naturally captures the full packet (138 bytes for real firmware,
+        // 130 bytes for the simulator) without ever stranding leftover bytes.
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(self.config.read_timeout_ms);
-        let mut buf: Vec<u8> = Vec::with_capacity(MAX_PACKET_BYTES);
-        let mut tmp = [0u8; 64];
+        let mut buffer: Vec<u8> = Vec::with_capacity(MAX_PACKET_BYTES);
 
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            let wait = if buf.len() >= MIN_PACKET_BYTES {
-                remaining.min(Duration::from_millis(IDLE_DONE_MS))
-            } else {
-                remaining
-            };
-            match timeout(wait, conn.read(&mut tmp)).await {
-                Ok(Ok(0)) | Err(_) => break,
+            let idle_timeout = remaining.min(Duration::from_millis(PACKET_IDLE_MS));
+            let mut tmp = [0u8; 64];
+            match timeout(idle_timeout, conn.read(&mut tmp)).await {
+                Ok(Ok(0)) => break,                              // EOF
                 Ok(Ok(n)) => {
-                    buf.extend_from_slice(&tmp[..n]);
-                    if buf.len() >= MAX_PACKET_BYTES {
-                        break;
-                    }
+                    buffer.extend_from_slice(&tmp[..n]);
+                    if buffer.len() >= MAX_PACKET_BYTES { break; }
                 }
                 Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
+                Err(_) => break,                                 // bus idle
             }
         }
 
-        if buf.len() < MIN_PACKET_BYTES {
-            debug!("Short packet: {} bytes — discarding", buf.len());
+        if buffer.is_empty() {
+            error!("Read timeout after {}ms", self.config.read_timeout_ms);
             return Err(SerialError::ReadTimeout {
                 timeout_ms: self.config.read_timeout_ms,
             }
             .into());
         }
 
-        debug!("Received {} bytes from ECU", buf.len());
-        Ok(buf)
-    }
-
-    /// Discard bytes from `conn` until `idle_ms` of continuous silence.
-    async fn drain_until_quiet(conn: &mut EcuConnection, idle_ms: u64) {
-        let mut drain = [0u8; 64];
-        loop {
-            match timeout(Duration::from_millis(idle_ms), conn.read(&mut drain)).await {
-                Ok(Ok(0)) | Err(_) => break,
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => break,
-            }
-        }
+        debug!("Received {} bytes from ECU", buffer.len());
+        Ok(buffer)
     }
 
     /// Attempt to reconnect with exponential backoff

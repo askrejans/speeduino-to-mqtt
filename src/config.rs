@@ -417,32 +417,39 @@ pub fn load_configuration(config_path: Option<&str>) -> Result<AppConfig> {
         builder = builder.add_source(File::with_name(path).required(true));
         Some(path.to_string())
     } else {
-        let default_locations = ["./settings.toml", "./speeduino-to-mqtt.toml"];
+        // Build a prioritised list of candidate paths.
+        // Earlier entries have lower priority (later sources override earlier ones
+        // in the `config` crate), so list most-specific last.
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
 
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                let exe_config = parent.join("settings.toml");
-                if exe_config.exists() {
-                    debug!("Found config in executable directory: {:?}", exe_config);
-                    builder = builder.add_source(File::from(exe_config).required(false));
-                }
-            }
-        }
-
-        let system_locations = [
+        // 1. System-wide locations (lowest priority)
+        for loc in &[
             "/usr/etc/g86-car-telemetry/speeduino-to-mqtt.toml",
             "/etc/g86-car-telemetry/speeduino-to-mqtt.toml",
             "/etc/speeduino-to-mqtt/settings.toml",
-        ];
+        ] {
+            candidates.push(std::path::PathBuf::from(loc));
+        }
+
+        // 2. Directory containing the executable (covers `cargo install` and
+        //    installed service binaries).
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                candidates.push(parent.join("settings.toml"));
+                candidates.push(parent.join("speeduino-to-mqtt.toml"));
+            }
+        }
+
+        // 3. Current working directory (highest priority — developer / manual run).
+        candidates.push(std::path::PathBuf::from("./settings.toml"));
+        candidates.push(std::path::PathBuf::from("./speeduino-to-mqtt.toml"));
 
         let mut found_path = None;
-        for location in default_locations.iter().chain(system_locations.iter()) {
-            if Path::new(location).exists() {
-                debug!("Found config at: {}", location);
-                builder = builder.add_source(File::with_name(location).required(false));
-                if found_path.is_none() {
-                    found_path = Some(location.to_string());
-                }
+        for path in &candidates {
+            if path.exists() {
+                debug!("Found config at: {:?}", path);
+                builder = builder.add_source(File::from(path.clone()).required(false));
+                found_path = Some(path.display().to_string());
             }
         }
 
