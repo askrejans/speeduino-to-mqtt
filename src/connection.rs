@@ -68,6 +68,7 @@ impl EcuConnection {
     }
 
     /// Attempt to clear input/output buffers.  No-op for TCP connections.
+    #[allow(dead_code)]
     pub fn clear_buffers(&self) -> io::Result<()> {
         if let EcuConnection::Serial(port) = self {
             port.clear(tokio_serial::ClearBuffer::All)?;
