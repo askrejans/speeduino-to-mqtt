@@ -20,9 +20,12 @@ const MIN_PACKET_BYTES: usize = 130;
 /// Largest possible Speeduino primary-serial packet.
 const MAX_PACKET_BYTES: usize = 256;
 /// How long to wait for the bus to go quiet during the scout read.
-/// Must be longer than the packet transmission time (~12 ms at 115200 baud)
-/// but short enough not to stall startup. 60 ms is safe.
-const SCOUT_IDLE_MS: u64 = 60;
+/// 138 bytes at 115200 baud takes ~12 ms.  40 ms is 3× that with USB
+/// bulk-transfer headroom but short enough to avoid capturing stray bytes.
+const SCOUT_IDLE_MS: u64 = 40;
+/// How long to wait for silence before sending the scout command.
+/// This drains any stale bytes already in the OS receive buffer.
+const PRE_DRAIN_IDLE_MS: u64 = 25;
 
 /// ECU connection handler — supports hardware serial and TCP (e.g. WiFi bridge).
 pub struct EcuSerialHandler {
@@ -87,9 +90,32 @@ impl EcuSerialHandler {
             Some(s) => s,
             None => {
                 // ── Scout read ───────────────────────────────────────────────
-                // Send 'A' and collect bytes until SCOUT_IDLE_MS of silence.
-                // This tells us the exact packet size the ECU produces.
+                // Step 1: pre-drain — discard any bytes already sitting in the
+                // OS buffer (leftovers from a previous session / partial reads).
+                // Loop until PRE_DRAIN_IDLE_MS of silence, meaning the buffer
+                // is now empty and the next bytes we read are fresh response.
                 debug!("Scouting ECU packet size…");
+                {
+                    let mut drain = [0u8; 64];
+                    let mut drained = 0usize;
+                    loop {
+                        match timeout(
+                            Duration::from_millis(PRE_DRAIN_IDLE_MS),
+                            conn.read(&mut drain),
+                        )
+                        .await
+                        {
+                            Ok(Ok(0)) | Err(_) => break,
+                            Ok(Ok(n)) => drained += n,
+                            Ok(Err(_)) => break,
+                        }
+                    }
+                    if drained > 0 {
+                        debug!("Scout pre-drain: discarded {} stale bytes", drained);
+                    }
+                }
+
+                // Step 2: send the command.
                 conn.write_all(&[ECU_COMMAND])
                     .await
                     .map_err(SerialError::WriteFailed)?;
