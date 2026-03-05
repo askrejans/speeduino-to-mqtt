@@ -15,17 +15,14 @@ use tracing::{debug, error, info, warn};
 /// ECU command to request realtime data
 const ECU_COMMAND: u8 = b'A';
 
-/// Minimum bytes we must see in a scout read to accept the packet size.
+/// Minimum bytes we must see to have a valid primary-serial packet.
 const MIN_PACKET_BYTES: usize = 130;
-/// Largest possible Speeduino primary-serial packet.
-const MAX_PACKET_BYTES: usize = 256;
-/// How long to wait for the bus to go quiet during the scout read.
-/// 138 bytes at 115200 baud takes ~12 ms.  40 ms is 3× that with USB
-/// bulk-transfer headroom but short enough to avoid capturing stray bytes.
-const SCOUT_IDLE_MS: u64 = 40;
-/// How long to wait for silence before sending the scout command.
-/// This drains any stale bytes already in the OS receive buffer.
-const PRE_DRAIN_IDLE_MS: u64 = 25;
+/// After reading `expected_data_length` bytes, keep draining until this many ms
+/// of silence.  Handles firmware that sends more bytes than the configured
+/// length (e.g. real ECU = 138 bytes, config default = 130).
+const POST_DRAIN_IDLE_MS: u64 = 25;
+/// Cap on extra bytes collected by the post-drain loop.
+const MAX_EXTRA_BYTES: usize = 64;
 
 /// ECU connection handler — supports hardware serial and TCP (e.g. WiFi bridge).
 pub struct EcuSerialHandler {
@@ -33,9 +30,6 @@ pub struct EcuSerialHandler {
     config: AppConfig,
     retry_count: u32,
     current_delay_ms: u64,
-    /// Packet size discovered by the first successful scout read.
-    /// Reset to None on disconnect so we re-scout after reconnection.
-    packet_size: Option<usize>,
 }
 
 impl EcuSerialHandler {
@@ -46,7 +40,6 @@ impl EcuSerialHandler {
             config: config.clone(),
             retry_count: 0,
             current_delay_ms: config.initial_retry_delay_ms,
-            packet_size: None,
         }
     }
 
@@ -71,7 +64,6 @@ impl EcuSerialHandler {
 
     /// Close the ECU connection.
     pub async fn disconnect(&mut self) {
-        self.packet_size = None; // re-scout on next connect
         if self.connection.take().is_some() {
             debug!("ECU connection closed");
         }
@@ -79,129 +71,80 @@ impl EcuSerialHandler {
 
     /// Read engine data from the ECU.
     ///
-    /// On the first call after (re)connect a "scout" read is performed:
-    /// send 'A', collect bytes until the bus is quiet, record the packet size.
-    /// All subsequent calls use `read_exact(packet_size)` — perfectly
-    /// deterministic, nothing ever left in the buffer.
+    /// Strategy:
+    ///   1. `clear_buffers()` — instant kernel FIFO purge, discards any stale
+    ///      bytes left over from a previous cycle or a previous run.
+    ///   2. Send `A`, `flush()`.
+    ///   3. `read_exact(expected_data_length)` — deterministic; blocks until
+    ///      every byte is received.
+    ///   4. Post-drain — collect any additional bytes that arrive within
+    ///      `POST_DRAIN_IDLE_MS` ms (e.g. real ECU sends 138, config says 130;
+    ///      the extra 8 bytes are drained here so they never pollute the next
+    ///      cycle).
     pub async fn read_engine_data(&mut self) -> Result<Vec<u8>> {
         let conn = self.connection.as_mut().ok_or(SerialError::Disconnected)?;
 
-        let size = match self.packet_size {
-            Some(s) => s,
-            None => {
-                // ── Scout read ───────────────────────────────────────────────
-                // Step 1: pre-drain — discard any bytes already sitting in the
-                // OS buffer (leftovers from a previous session / partial reads).
-                // Loop until PRE_DRAIN_IDLE_MS of silence, meaning the buffer
-                // is now empty and the next bytes we read are fresh response.
-                debug!("Scouting ECU packet size…");
-                {
-                    let mut drain = [0u8; 64];
-                    let mut drained = 0usize;
-                    loop {
-                        match timeout(
-                            Duration::from_millis(PRE_DRAIN_IDLE_MS),
-                            conn.read(&mut drain),
-                        )
-                        .await
-                        {
-                            Ok(Ok(0)) | Err(_) => break,
-                            Ok(Ok(n)) => drained += n,
-                            Ok(Err(_)) => break,
-                        }
-                    }
-                    if drained > 0 {
-                        debug!("Scout pre-drain: discarded {} stale bytes", drained);
-                    }
-                }
+        // ── 1. Pre-clear ────────────────────────────────────────────────────
+        // Kernel-level instant UART/USB FIFO purge.  No-op for TCP.
+        // Eliminates stale bytes without any timing dependency.
+        conn.clear_buffers().ok();
 
-                // Step 2: send the command.
-                conn.write_all(&[ECU_COMMAND])
-                    .await
-                    .map_err(SerialError::WriteFailed)?;
-                conn.flush().await.map_err(SerialError::WriteFailed)?;
-
-                let deadline = tokio::time::Instant::now()
-                    + Duration::from_millis(self.config.read_timeout_ms);
-                let mut scout_buf: Vec<u8> = Vec::with_capacity(MAX_PACKET_BYTES);
-                let mut tmp = [0u8; 64];
-
-                loop {
-                    let remaining =
-                        deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    // Wait up to SCOUT_IDLE_MS once we have enough bytes.
-                    let wait = if scout_buf.len() >= MIN_PACKET_BYTES {
-                        remaining.min(Duration::from_millis(SCOUT_IDLE_MS))
-                    } else {
-                        remaining
-                    };
-                    match timeout(wait, conn.read(&mut tmp)).await {
-                        Ok(Ok(0)) | Err(_) => break,
-                        Ok(Ok(n)) => {
-                            scout_buf.extend_from_slice(&tmp[..n]);
-                            if scout_buf.len() >= MAX_PACKET_BYTES {
-                                break;
-                            }
-                        }
-                        Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
-                    }
-                }
-
-                if scout_buf.len() < MIN_PACKET_BYTES {
-                    warn!(
-                        "Scout read too short: {} bytes (expected ≥{})",
-                        scout_buf.len(),
-                        MIN_PACKET_BYTES
-                    );
-                    return Err(SerialError::ReadTimeout {
-                        timeout_ms: self.config.read_timeout_ms,
-                    }
-                    .into());
-                }
-
-                let detected = scout_buf.len();
-                info!("ECU packet size detected: {} bytes", detected);
-                self.packet_size = Some(detected);
-                return Ok(scout_buf);
-            }
-        };
-
-        // ── Normal read: read_exact(known size) ────────────────────────────
-        // We consume exactly what the ECU sends — no leftover bytes, ever.
+        // ── 2. Send command ─────────────────────────────────────────────────
         debug!("Sending ECU command: 0x{:02X}", ECU_COMMAND);
         conn.write_all(&[ECU_COMMAND])
             .await
             .map_err(SerialError::WriteFailed)?;
         conn.flush().await.map_err(SerialError::WriteFailed)?;
 
-        let mut buffer = vec![0u8; size];
+        // ── 3. read_exact ───────────────────────────────────────────────────
+        let expected = self.config.expected_data_length;
+        let mut buffer = vec![0u8; expected];
         match timeout(
             Duration::from_millis(self.config.read_timeout_ms),
             conn.read_exact(&mut buffer),
         )
         .await
         {
-            Ok(Ok(_)) => {
-                debug!("Read {} bytes from ECU", buffer.len());
-                Ok(buffer)
-            }
+            Ok(Ok(_)) => debug!("read_exact: got {} bytes", expected),
             Ok(Err(e)) => {
-                error!("Failed to read from serial port: {}", e);
-                Err(SerialError::ReadFailed(e).into())
+                error!("Serial read error: {}", e);
+                return Err(SerialError::ReadFailed(e).into());
             }
             Err(_) => {
                 error!("Read timeout after {}ms", self.config.read_timeout_ms);
-                // Reset packet size so next attempt re-scouts
-                self.packet_size = None;
-                Err(SerialError::ReadTimeout {
+                return Err(SerialError::ReadTimeout {
                     timeout_ms: self.config.read_timeout_ms,
                 }
-                .into())
+                .into());
             }
         }
+
+        // ── 4. Post-drain ───────────────────────────────────────────────────
+        // Real firmware may send more bytes than `expected_data_length`.
+        // Drain extras so the OS buffer is empty for the next cycle.
+        let mut tmp = [0u8; 64];
+        let mut extra: Vec<u8> = Vec::new();
+        loop {
+            match timeout(Duration::from_millis(POST_DRAIN_IDLE_MS), conn.read(&mut tmp)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    if extra.len() + n <= MAX_EXTRA_BYTES {
+                        extra.extend_from_slice(&tmp[..n]);
+                    }
+                }
+                Ok(Err(_)) => break,
+            }
+        }
+        if !extra.is_empty() {
+            debug!("Post-drain: {} extra bytes (total {})", extra.len(), expected + extra.len());
+            buffer.extend_from_slice(&extra);
+        }
+
+        if buffer.len() < MIN_PACKET_BYTES {
+            warn!("Packet too short: {} bytes (expected ≥{})", buffer.len(), MIN_PACKET_BYTES);
+        }
+
+        Ok(buffer)
     }
 
     /// Attempt to reconnect with exponential backoff
