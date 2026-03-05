@@ -15,12 +15,8 @@ use tracing::{debug, error, info, warn};
 /// ECU command to request realtime data
 const ECU_COMMAND: u8 = b'A';
 
-/// Delay after sending command before reading response
-const COMMAND_PROCESSING_DELAY_MS: u64 = 50;
-
-/// Stop collecting response bytes after this many ms of bus silence.
-/// At 115200 baud, 138 bytes transmit in ~12 ms, so 20 ms comfortably
-/// catches even a slow ECU while not blocking more than one refresh cycle.
+/// Short idle window used only after the target byte count is reached,
+/// to capture any trailing bytes (real firmware sends 138 vs sim's 130).
 const PACKET_IDLE_MS: u64 = 20;
 
 /// Maximum response buffer size – larger than any known Speeduino packet.
@@ -73,10 +69,25 @@ impl EcuSerialHandler {
 
     /// Read engine data from the ECU
     ///
-    /// Sends the 'A' command and reads the response. Returns whatever bytes
-    /// arrived — size validation is handled by the parser layer.
+    /// Sends the 'A' command and streams the response until `expected_data_length`
+    /// bytes have arrived, then allows a short idle window for any trailing bytes
+    /// (real firmware 138 B vs simulator 130 B).  Pre-flushing before the command
+    /// prevents leftover bytes from a previous partial read causing misaligned data.
     pub async fn read_engine_data(&mut self) -> Result<Vec<u8>> {
         let conn = self.connection.as_mut().ok_or(SerialError::Disconnected)?;
+
+        // ── Pre-flush: clear any stale bytes from a previous partial read ─────
+        // Must happen BEFORE sending the new command so we never discard live data.
+        conn.clear_buffers().ok();
+        {
+            let mut tmp = [0u8; 64];
+            while let Ok(Ok(n)) = timeout(Duration::from_millis(5), conn.read(&mut tmp)).await {
+                if n == 0 {
+                    break;
+                }
+                debug!("Pre-flush: discarded {} stale bytes", n);
+            }
+        }
 
         // ── Send command ──────────────────────────────────────────────────────
         debug!("Sending ECU command: 0x{:02X}", ECU_COMMAND);
@@ -85,34 +96,43 @@ impl EcuSerialHandler {
             .map_err(SerialError::WriteFailed)?;
         conn.flush().await.map_err(SerialError::WriteFailed)?;
 
-        // Wait for ECU to begin transmitting
-        sleep(Duration::from_millis(COMMAND_PROCESSING_DELAY_MS)).await;
-
-        // ── Read until bus goes idle ──────────────────────────────────────────
-        // Collect bytes until no new data arrives for PACKET_IDLE_MS, or until
-        // the overall deadline expires. No minimum-size gate: whatever the ECU
-        // sent is passed straight to the parser.
+        // ── Stream until expected packet size ─────────────────────────────────
+        // Read with the full deadline as the per-chunk timeout so inter-byte gaps
+        // on USB-CDC or TCP never cause a premature break mid-packet.
+        let target = self.config.expected_data_length;
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(self.config.read_timeout_ms);
         let mut buffer: Vec<u8> = Vec::with_capacity(MAX_PACKET_BYTES);
 
-        loop {
+        while buffer.len() < target {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            let idle = remaining.min(Duration::from_millis(PACKET_IDLE_MS));
             let mut tmp = [0u8; 64];
-            match timeout(idle, conn.read(&mut tmp)).await {
-                Ok(Ok(0)) => break,                         // EOF
-                Ok(Ok(n)) => {
-                    buffer.extend_from_slice(&tmp[..n]);
-                    if buffer.len() >= MAX_PACKET_BYTES {
-                        break;
-                    }
-                }
+            match timeout(remaining, conn.read(&mut tmp)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => buffer.extend_from_slice(&tmp[..n]),
                 Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
-                Err(_) => break,                            // bus idle
+                Err(_) => break,
+            }
+        }
+
+        // ── Short idle window for trailing bytes ──────────────────────────────
+        // Once the target is met, grab any extra bytes that are already available
+        // (real firmware sends 138 bytes; this catches the remaining 8 if target=130).
+        if buffer.len() >= target {
+            let mut tmp = [0u8; 32];
+            loop {
+                match timeout(Duration::from_millis(PACKET_IDLE_MS), conn.read(&mut tmp)).await {
+                    Ok(Ok(n)) if n > 0 => {
+                        buffer.extend_from_slice(&tmp[..n]);
+                        if buffer.len() >= MAX_PACKET_BYTES {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
             }
         }
 
