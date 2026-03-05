@@ -23,9 +23,6 @@ const COMMAND_PROCESSING_DELAY_MS: u64 = 50;
 /// catches even a slow ECU while not blocking more than one refresh cycle.
 const PACKET_IDLE_MS: u64 = 20;
 
-/// Minimum bytes required for a valid primary-serial packet.
-const MIN_PACKET_BYTES: usize = 130;
-
 /// Maximum response buffer size – larger than any known Speeduino packet.
 const MAX_PACKET_BYTES: usize = 256;
 
@@ -76,23 +73,10 @@ impl EcuSerialHandler {
 
     /// Read engine data from the ECU
     ///
-    /// Sends the 'A' command and reads the expected data packet
+    /// Sends the 'A' command and reads the response. Returns whatever bytes
+    /// arrived — size validation is handled by the parser layer.
     pub async fn read_engine_data(&mut self) -> Result<Vec<u8>> {
         let conn = self.connection.as_mut().ok_or(SerialError::Disconnected)?;
-
-        // ── Pre-flush: drain any stale bytes left from a previous cycle ──────
-        // clear_buffers() is a no-op for TCP, so always do a brief async drain
-        // as well.  Use a very short deadline so we don't stall the loop.
-        conn.clear_buffers().ok();
-        {
-            let mut tmp = [0u8; 64];
-            while let Ok(Ok(n)) =
-                timeout(Duration::from_millis(5), conn.read(&mut tmp)).await
-            {
-                if n == 0 { break; }
-                debug!("Pre-flush: discarded {} stale bytes", n);
-            }
-        }
 
         // ── Send command ──────────────────────────────────────────────────────
         debug!("Sending ECU command: 0x{:02X}", ECU_COMMAND);
@@ -105,9 +89,9 @@ impl EcuSerialHandler {
         sleep(Duration::from_millis(COMMAND_PROCESSING_DELAY_MS)).await;
 
         // ── Read until bus goes idle ──────────────────────────────────────────
-        // Collect bytes until no new data arrives for PACKET_IDLE_MS.
-        // This naturally captures the full packet (138 bytes for real firmware,
-        // 130 bytes for the simulator) without ever stranding leftover bytes.
+        // Collect bytes until no new data arrives for PACKET_IDLE_MS, or until
+        // the overall deadline expires. No minimum-size gate: whatever the ECU
+        // sent is passed straight to the parser.
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(self.config.read_timeout_ms);
         let mut buffer: Vec<u8> = Vec::with_capacity(MAX_PACKET_BYTES);
@@ -117,28 +101,23 @@ impl EcuSerialHandler {
             if remaining.is_zero() {
                 break;
             }
-            // Two-phase idle: wait up to the full deadline until MIN_PACKET_BYTES
-            // have arrived (handles inter-chunk gaps on Linux USB-CDC), then
-            // switch to a short PACKET_IDLE_MS to detect end-of-packet.
-            let idle_timeout = if buffer.len() >= MIN_PACKET_BYTES {
-                remaining.min(Duration::from_millis(PACKET_IDLE_MS))
-            } else {
-                remaining
-            };
+            let idle = remaining.min(Duration::from_millis(PACKET_IDLE_MS));
             let mut tmp = [0u8; 64];
-            match timeout(idle_timeout, conn.read(&mut tmp)).await {
-                Ok(Ok(0)) => break,                              // EOF
+            match timeout(idle, conn.read(&mut tmp)).await {
+                Ok(Ok(0)) => break,                         // EOF
                 Ok(Ok(n)) => {
                     buffer.extend_from_slice(&tmp[..n]);
-                    if buffer.len() >= MAX_PACKET_BYTES { break; }
+                    if buffer.len() >= MAX_PACKET_BYTES {
+                        break;
+                    }
                 }
                 Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
-                Err(_) => break,                                 // bus idle
+                Err(_) => break,                            // bus idle
             }
         }
 
-        if buffer.len() < MIN_PACKET_BYTES {
-            debug!("Short packet: {} bytes — discarding", buffer.len());
+        if buffer.is_empty() {
+            warn!("No data received from ECU within {}ms", self.config.read_timeout_ms);
             return Err(SerialError::ReadTimeout {
                 timeout_ms: self.config.read_timeout_ms,
             }
