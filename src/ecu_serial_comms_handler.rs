@@ -94,6 +94,17 @@ impl EcuSerialHandler {
         {
             Ok(Ok(_)) => {
                 debug!("Successfully read {} bytes from ECU", buffer.len());
+                // Drain any bytes beyond what we asked for (e.g. real firmware sends
+                // 138 bytes but expected_data_length may be 130).  Leftover bytes in
+                // the OS buffer would offset every subsequent read, causing garbage.
+                let mut drain = [0u8; 64];
+                loop {
+                    match timeout(Duration::from_millis(10), conn.read(&mut drain)).await {
+                        Ok(Ok(0)) | Err(_) => break,
+                        Ok(Ok(n)) => debug!("Drained {} trailing bytes from ECU buffer", n),
+                        Ok(Err(_)) => break,
+                    }
+                }
                 Ok(buffer)
             }
             Ok(Err(e)) => {
