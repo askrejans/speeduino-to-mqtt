@@ -23,6 +23,9 @@ const COMMAND_PROCESSING_DELAY_MS: u64 = 50;
 /// catches even a slow ECU while not blocking more than one refresh cycle.
 const PACKET_IDLE_MS: u64 = 20;
 
+/// Minimum bytes required for a valid primary-serial packet.
+const MIN_PACKET_BYTES: usize = 130;
+
 /// Maximum response buffer size – larger than any known Speeduino packet.
 const MAX_PACKET_BYTES: usize = 256;
 
@@ -114,7 +117,14 @@ impl EcuSerialHandler {
             if remaining.is_zero() {
                 break;
             }
-            let idle_timeout = remaining.min(Duration::from_millis(PACKET_IDLE_MS));
+            // Two-phase idle: wait up to the full deadline until MIN_PACKET_BYTES
+            // have arrived (handles inter-chunk gaps on Linux USB-CDC), then
+            // switch to a short PACKET_IDLE_MS to detect end-of-packet.
+            let idle_timeout = if buffer.len() >= MIN_PACKET_BYTES {
+                remaining.min(Duration::from_millis(PACKET_IDLE_MS))
+            } else {
+                remaining
+            };
             let mut tmp = [0u8; 64];
             match timeout(idle_timeout, conn.read(&mut tmp)).await {
                 Ok(Ok(0)) => break,                              // EOF
@@ -127,8 +137,8 @@ impl EcuSerialHandler {
             }
         }
 
-        if buffer.is_empty() {
-            error!("Read timeout after {}ms", self.config.read_timeout_ms);
+        if buffer.len() < MIN_PACKET_BYTES {
+            debug!("Short packet: {} bytes — discarding", buffer.len());
             return Err(SerialError::ReadTimeout {
                 timeout_ms: self.config.read_timeout_ms,
             }
