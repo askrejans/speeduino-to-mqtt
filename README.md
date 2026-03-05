@@ -2,7 +2,7 @@
 
 A Rust application that reads real-time engine data from a [Speeduino](https://speeduino.com) ECU and publishes it to an MQTT broker. Supports hardware serial ports and TCP/IP bridges (WiFi, Ethernet), an interactive terminal UI for standalone/bench use, and fully optional MQTT so the app can run display-only without any broker.
 
-> **Testing:** [speeduino-serial-sim](https://github.com/askrejans/speeduino-serial-sim) can be used to generate synthetic ECU data without a real ECU.
+![speeduino-to-mqtt](https://github.com/user-attachments/assets/769b1ad8-092c-4101-8461-65cdcd04bb9b)
 
 ## Features
 
@@ -13,6 +13,8 @@ A Rust application that reads real-time engine data from a [Speeduino](https://s
 - **Flexible configuration** – TOML config file, environment variables with `SPEEDUINO_` prefix, and automatic `.env` file loading from the working directory.
 - **Systemd service** – ships with a ready-made service unit; the `scripts/build_packages.sh` helper builds installable DEB and RPM packages.
 - **85+ MQTT topics** – every ECU parameter is published as a short three-letter code under a configurable base topic.
+
+> **Testing:** [speeduino-serial-sim](https://github.com/askrejans/speeduino-serial-sim) can be used to generate synthetic ECU data without a real ECU.
 
 ## Running modes
 
