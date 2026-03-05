@@ -21,9 +21,14 @@ const ECU_COMMAND: u8 = b'A';
 const PRE_FLUSH_IDLE_MS: u64 = 50;
 
 /// After the command is sent, collect bytes until the bus has been silent for
-/// this long. 30 ms > the ~12 ms needed to transmit 138 bytes, so this
-/// reliably marks end-of-packet without ever leaving trailing bytes.
+/// this long — but only once MIN_PACKET_BYTES have arrived. Before that
+/// threshold is reached we wait for the full deadline so mid-packet OS
+/// buffering gaps don't prematurely terminate the read.
 const PACKET_IDLE_MS: u64 = 30;
+
+/// Minimum bytes we must receive before treating an idle gap as end-of-packet.
+/// Matches the parser's MIN_BYTES constant (130 = sim / real firmware minimum).
+const MIN_PACKET_BYTES: usize = 130;
 
 /// Maximum response buffer size – larger than any known Speeduino packet.
 const MAX_PACKET_BYTES: usize = 256;
@@ -100,10 +105,13 @@ impl EcuSerialHandler {
             .map_err(SerialError::WriteFailed)?;
         conn.flush().await.map_err(SerialError::WriteFailed)?;
 
-        // ── Read until bus goes idle ──────────────────────────────────────────
-        // Collect bytes until no new data arrives for PACKET_IDLE_MS.
-        // This naturally captures the full packet (138 bytes for real firmware,
-        // 130 bytes for the simulator) without ever stranding leftover bytes.
+        // ── Read until bus goes idle after a full packet ──────────────────────
+        // Two-phase behaviour:
+        //   • Fewer than MIN_PACKET_BYTES received → wait up to the full
+        //     deadline; an idle gap here is just the ECU starting to respond
+        //     or the OS delivering bytes in small chunks.
+        //   • MIN_PACKET_BYTES or more received → a PACKET_IDLE_MS gap means
+        //     the ECU has finished sending; stop collecting.
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(self.config.read_timeout_ms);
         let mut buffer: Vec<u8> = Vec::with_capacity(MAX_PACKET_BYTES);
@@ -113,7 +121,13 @@ impl EcuSerialHandler {
             if remaining.is_zero() {
                 break;
             }
-            let idle_timeout = remaining.min(Duration::from_millis(PACKET_IDLE_MS));
+            let idle_timeout = if buffer.len() >= MIN_PACKET_BYTES {
+                // Enough bytes received — a short idle means end-of-packet.
+                remaining.min(Duration::from_millis(PACKET_IDLE_MS))
+            } else {
+                // Still waiting for a full packet — don't give up on a gap.
+                remaining
+            };
             match timeout(idle_timeout, conn.read(&mut tmp)).await {
                 Ok(Ok(0)) => break,                              // EOF
                 Ok(Ok(n)) => {
