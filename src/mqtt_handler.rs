@@ -82,7 +82,10 @@ impl MqttHandler {
 
     /// Connect to MQTT broker with authentication and TLS support
     pub async fn connect(&mut self) -> Result<()> {
-        info!("Connecting to MQTT broker at {}:{}", self.config.mqtt_host, self.config.mqtt_port);
+        info!(
+            "Connecting to MQTT broker at {}:{}",
+            self.config.mqtt_host, self.config.mqtt_port
+        );
 
         let mut conn_opts_builder = mqtt::ConnectOptionsBuilder::new();
         conn_opts_builder
@@ -103,24 +106,27 @@ impl MqttHandler {
         // Configure TLS/SSL if enabled
         if self.config.mqtt_use_tls {
             info!("Configuring TLS/SSL for MQTT connection");
-            
+
             let mut ssl_opts_builder = mqtt::SslOptionsBuilder::new();
-            
+
             if let Some(ref ca_path) = self.config.mqtt_ca_cert_path {
                 debug!("Using CA certificate: {}", ca_path);
-                ssl_opts_builder.trust_store(ca_path)
+                ssl_opts_builder
+                    .trust_store(ca_path)
                     .map_err(|e| MqttError::TlsError(e.to_string()))?;
             }
 
             if let Some(ref cert_path) = self.config.mqtt_client_cert_path {
                 debug!("Using client certificate: {}", cert_path);
-                ssl_opts_builder.key_store(cert_path)
+                ssl_opts_builder
+                    .key_store(cert_path)
                     .map_err(|e| MqttError::TlsError(e.to_string()))?;
             }
 
             if let Some(ref key_path) = self.config.mqtt_client_key_path {
                 debug!("Using client private key: {}", key_path);
-                ssl_opts_builder.private_key(key_path)
+                ssl_opts_builder
+                    .private_key(key_path)
                     .map_err(|e| MqttError::TlsError(e.to_string()))?;
             }
 
@@ -128,7 +134,10 @@ impl MqttHandler {
             conn_opts_builder.ssl_options(ssl_opts);
         }
 
+        // Build connection options and drop the builder BEFORE awaiting so that the
+        // future stays `Send` (ConnectOptionsBuilder wraps raw FFI pointers).
         let conn_opts = conn_opts_builder.finalize();
+        drop(conn_opts_builder);
 
         // Attempt connection
         self.client
@@ -177,6 +186,7 @@ impl MqttHandler {
     }
 
     /// Queue a message for publishing (non-blocking)
+    #[allow(dead_code)]
     pub async fn queue_message(&self, message: MqttMessage) -> Result<()> {
         self.message_buffer
             .send(message)
@@ -187,8 +197,9 @@ impl MqttHandler {
 
     /// Start the message publishing task (consumes buffer receiver)
     pub async fn start_publishing_task(mut self) -> Result<()> {
-        let mut receiver = self.buffer_receiver.take()
-            .ok_or_else(|| MqttError::ClientCreationFailed("Buffer receiver already taken".to_string()))?;
+        let mut receiver = self.buffer_receiver.take().ok_or_else(|| {
+            MqttError::ClientCreationFailed("Buffer receiver already taken".to_string())
+        })?;
 
         info!("Starting MQTT message publishing task");
 
@@ -202,22 +213,24 @@ impl MqttHandler {
                 }
                 Err(e) => {
                     error!("Failed to publish message to {}: {}", message.topic, e);
-                    
+
                     // Attempt reconnection with exponential backoff
                     self.is_connected = false;
                     self.reconnection_attempts += 1;
-                    
+
                     if self.reconnection_attempts <= self.config.max_retry_count {
-                        warn!("Attempting to reconnect (attempt {}/{})", 
-                            self.reconnection_attempts, self.config.max_retry_count);
-                        
+                        warn!(
+                            "Attempting to reconnect (attempt {}/{})",
+                            self.reconnection_attempts, self.config.max_retry_count
+                        );
+
                         let delay = self.calculate_backoff_delay();
                         sleep(Duration::from_millis(delay)).await;
-                        
+
                         if let Err(e) = self.connect().await {
                             error!("Reconnection failed: {}", e);
                         }
-                        
+
                         // Retry publishing this message
                         if self.is_connected {
                             if let Err(e) = self.publish(&message).await {
@@ -240,26 +253,28 @@ impl MqttHandler {
         let base_delay = self.config.initial_retry_delay_ms;
         let max_delay = self.config.max_retry_delay_ms;
         let attempts = self.reconnection_attempts.saturating_sub(1) as u32;
-        
+
         let delay = base_delay * 2_u64.pow(attempts);
         delay.min(max_delay)
     }
 
     /// Check if connected
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.is_connected && self.client.is_connected()
     }
 
     /// Disconnect from broker
+    #[allow(dead_code)]
     pub async fn disconnect(&mut self) -> Result<()> {
         if self.is_connected {
             info!("Disconnecting from MQTT broker");
-            
+
             self.client
                 .disconnect(None)
                 .await
                 .map_err(MqttError::DisconnectFailed)?;
-            
+
             self.is_connected = false;
             info!("Disconnected from MQTT broker");
         }
@@ -285,16 +300,10 @@ mod tests {
 
     #[test]
     fn test_build_topic_path() {
-        assert_eq!(
-            build_topic_path("/GOLF86/ECU/", "RPM"),
-            "/GOLF86/ECU/RPM"
-        );
-        
-        assert_eq!(
-            build_topic_path("/GOLF86/ECU", "/RPM"),
-            "/GOLF86/ECU/RPM"
-        );
-        
+        assert_eq!(build_topic_path("/GOLF86/ECU/", "RPM"), "/GOLF86/ECU/RPM");
+
+        assert_eq!(build_topic_path("/GOLF86/ECU", "/RPM"), "/GOLF86/ECU/RPM");
+
         assert_eq!(
             build_topic_path("/test/", "/status/ready"),
             "/test/status/ready"
@@ -303,12 +312,8 @@ mod tests {
 
     #[test]
     fn test_mqtt_message_creation() {
-        let msg = MqttMessage::new(
-            "/test/topic".to_string(),
-            "test payload".to_string(),
-            1,
-        );
-        
+        let msg = MqttMessage::new("/test/topic".to_string(), "test payload".to_string(), 1);
+
         assert_eq!(msg.topic, "/test/topic");
         assert_eq!(msg.payload, "test payload");
         assert_eq!(msg.qos, 1);
@@ -320,20 +325,20 @@ mod tests {
         let mut config = AppConfig::default();
         config.initial_retry_delay_ms = 1000;
         config.max_retry_delay_ms = 60000;
-        
+
         let handler = MqttHandler::new(Arc::new(config)).unwrap();
-        
+
         // Test exponential backoff
         let mut test_handler = handler;
         test_handler.reconnection_attempts = 1;
         assert_eq!(test_handler.calculate_backoff_delay(), 1000);
-        
+
         test_handler.reconnection_attempts = 2;
         assert_eq!(test_handler.calculate_backoff_delay(), 2000);
-        
+
         test_handler.reconnection_attempts = 3;
         assert_eq!(test_handler.calculate_backoff_delay(), 4000);
-        
+
         // Should cap at max
         test_handler.reconnection_attempts = 20;
         assert_eq!(test_handler.calculate_backoff_delay(), 60000);
@@ -343,7 +348,7 @@ mod tests {
     async fn test_mqtt_handler_creation() {
         let config = Arc::new(AppConfig::default());
         let handler = MqttHandler::new(config);
-        
+
         assert!(handler.is_ok());
         let handler = handler.unwrap();
         assert!(!handler.is_connected());
@@ -354,7 +359,7 @@ mod tests {
         let msg0 = MqttMessage::new("topic".to_string(), "data".to_string(), 0);
         let msg1 = MqttMessage::new("topic".to_string(), "data".to_string(), 1);
         let msg2 = MqttMessage::new("topic".to_string(), "data".to_string(), 2);
-        
+
         assert_eq!(msg0.qos, 0);
         assert_eq!(msg1.qos, 1);
         assert_eq!(msg2.qos, 2);

@@ -1,89 +1,244 @@
 # Speeduino-to-MQTT
 
-Speeduino-to-MQTT is a Rust app built for reading Speeduino Engine Control Unit (ECU) serial signals and beaming crucial engine data to an MQTT broker. It gets the serial data using the "A" command for real-time ECU data. For testing purpouses [speeduino-serial-sim](https://github.com/askrejans/speeduino-serial-sim) can be used to generate test data.
+A Rust application that reads real-time engine data from a [Speeduino](https://speeduino.com) ECU and publishes it to an MQTT broker. Supports hardware serial ports and TCP/IP bridges (WiFi, Ethernet), an interactive terminal UI for standalone/bench use, and fully optional MQTT so the app can run display-only without any broker.
 
-**Note:**
-This software is in early development, so use it at your own risk. It's been tested successfully only with a 1000ms sample rate on a single device, but it might struggle with high-speed stuff, so more testing is needed here.
+> **Testing:** [speeduino-serial-sim](https://github.com/askrejans/speeduino-serial-sim) can be used to generate synthetic ECU data without a real ECU.
 
 ## Features
 
-- Hooks into Speeduino ECU serial signals, hits it with the ["A" command](https://wiki.speeduino.com/en/reference/Interface_Protocol), and parses out the engine data.
-- Pushes parsed engine data onto an MQTT broker. Right now, no encrypted connections or logins because to keep it simple for car LAN use.
+- **ECU protocol** – issues the [`A` real-time data command](https://wiki.speeduino.com/en/reference/Interface_Protocol), parses all bytes of the response including EMAP, CAN inputs (CN01–CN16), VVT, flex fuel, boost and more.
+- **Dual connection modes** – hardware serial (`/dev/ttyACM0`, COM3 …) or raw TCP socket for WiFi/Ethernet–serial bridges (ESP32, Moxa, USR-VIS410, …).
+- **Interactive TUI** – when run from a terminal (TTY detected) a live four-panel dashboard is displayed: connection status, ECU gauges, live MQTT stats and a scrolling log.
+- **Optional MQTT** – set `mqtt_enabled = false` (or `SPEEDUINO_MQTT_ENABLED=false`) to run in display-only mode with no broker required.
+- **Flexible configuration** – TOML config file, environment variables with `SPEEDUINO_` prefix, and automatic `.env` file loading from the working directory.
+- **Systemd service** – ships with a ready-made service unit; the `scripts/build_packages.sh` helper builds installable DEB and RPM packages.
+- **85+ MQTT topics** – every ECU parameter is published as a short three-letter code under a configurable base topic.
 
-## How to Use
+## Running modes
 
-1. **Grab the Latest Version**
+| Invocation | Behaviour |
+|---|---|
+| Terminal / bench (`ssh`, local shell) | Interactive TUI rendered via `ratatui` |
+| `systemd` service / no TTY | Structured text logging to stdout |
+| `mqtt_enabled = false` | No broker needed; data shown in TUI only |
+| `mqtt_enabled = true` (default) | Data published to MQTT broker |
 
-2. **Set it Up:** Tweak the `settings.toml` file to match your setup. There's a sample `example.settings.toml` in the main directory.
+## Quick start
 
-3. **Get it Running:** Set up your Rust build environment and fire up the build with:
+```bash
+# 1 – Build
+cargo build --release
 
-    ```bash
-    cargo build --release
-    ```
+# 2 – Copy and edit config
+cp example.settings.toml settings.toml
+$EDITOR settings.toml
 
-4. **Go Live:** Stick the `settings.toml` next to the executable at `target/release/speeduino-to-mqtt` and kick off the app.
+# 3 – Run (TUI auto-enabled when attached to a terminal)
+./target/release/speeduino-to-mqtt
 
-   ```bash
-   ./target/release/speeduino-to-mqtt
-
-## MQTT data example:
-Data is pushed as 3 letter codes (explained in source) to a configured MQTT topic.
-```code
-RPM: Engine revolutions per minute
-TPS: Throttle Position Sensor reading (0% to 100%)
-VE1: Volumetric Efficiency (%)
-O2P: Primary O2 sensor reading
-AFT: Air-Fuel Ratio Target
-MAT: Manifold Air Temperature sensor reading
-CAD: Coolant Analog-to-Digital Conversion value
-MAP: Manifold Absolute Pressure sensor reading
-BAT: Battery voltage (scaled by 10)
-ADV: Ignition Advance
-PW1: Pulse Width 1
-SPK: Spark
-DWL: Dwell time
-ILL: Idle Load
-BAR: Barometric Pressure
-TAE: Warm-Up Enrichment Correction (%)
-NER: Next Error code
-ENG: Engine status
+# 4 – Or pass a custom config path
+./target/release/speeduino-to-mqtt --config /etc/speeduino-to-mqtt/settings.toml
 ```
-More info:  [wiki.speeduino.com](https://wiki.speeduino.com/en/reference/Interface_Protocol)
 
-![image](https://github.com/askrejans/speeduino-to-mqtt/assets/1042303/d1b8cbd3-3f9a-471b-8dc1-bf206eb39693)
+## CLI options
 
-## Pre-Built Packages
+```
+Usage: speeduino-to-mqtt [options]
 
-There are also pre build packages, that combines three individual components: [Speeduino-to-MQTT](https://github.com/askrejans/speeduino-to-mqtt), [GPS-to-MQTT](https://github.com/askrejans/gps-to-mqtt), and [G86 Web Dashboard](https://github.com/askrejans/G86-web-dashboard) in one system with predefined services.
+Options:
+  -h, --help          Print help
+  -c, --config FILE   Path to TOML config file (default: settings.toml)
+```
 
-You can quickly get started by using pre-built packages available for both x64 and Raspberry Pi 4 (ARM) architectures:
+## Configuration
 
-- **DEB Packages for x64:** [Download here](https://akelaops.com/repo/deb/pool/main/amd64/g86-car-telemetry_1.0.deb)
-- **DEB Packages for Raspberry Pi 4 (ARM):** [Download here](https://akelaops.com/repo/deb/pool/main/aarch64/g86-car-telemetry_1.0.deb)
-- **RPM Packages for x64:** [Download here](https://akelaops.com/repo/rpm/x86_64/g86-car-telemetry-1.0-1.x86_64.rpm)
-- **RPM Packages for Raspberry Pi 4 (ARM):** [Download here](https://akelaops.com/repo/rpm/aarch64/g86-car-telemetry-1.0-1.aarch64.rpm)
+Copy `example.settings.toml` to `settings.toml` and adjust the values. Every setting can also be set via an environment variable with the `SPEEDUINO_` prefix, or in a `.env` file in the working directory.
 
-### Package Installation Details
+```toml
+# ── Connection ──────────────────────────────────────────────────
+connection_type = "serial"   # "serial" | "tcp"
 
-- All packages install the three services in the directory `/opt/g86-car-telemetry` (or `/usr/opt/g86-car-telemetry`).
-- Configuration files for GPS and ECU processors can be found under `/etc/g86-car-telemetry` (or `/usr/etc/g86-car-telemetry`).
-- Web project configurations are located in `/var/www/g86-car-telemetry/config` (or `/usr/var/www/g86-car-telemetry/config`).
-- Ensure to add relevant configurations for MQTT server, TTY ports, and any extra settings.
+# Serial (used when connection_type = "serial")
+port_name  = "/dev/ttyACM0"
+baud_rate  = 115200
 
-### Installed Services
+# TCP bridge (used when connection_type = "tcp")
+# tcp_host = "192.168.1.100"
+# tcp_port = 23
 
-The packages automatically install and manage the following services:
+# ── ECU protocol ────────────────────────────────────────────────
+# expected_data_length = 120   # 119–256; 121 enables EMAP
+# read_timeout_ms      = 2000
+refresh_rate_ms        = 20
 
-- `g86-car-telemetry-gps`
-- `g86-car-telemetry-speeduino`
-- `g86-car-telemetry-web`
+# ── MQTT ────────────────────────────────────────────────────────
+mqtt_enabled    = true
+mqtt_host       = "localhost"
+mqtt_port       = 1883
+mqtt_base_topic = "/GOLF86/ECU/"
+# mqtt_username = ""
+# mqtt_password = ""
+# mqtt_use_tls  = false
+```
 
-### Compatibility and Testing
+Key environment variables:
 
-These packages have been tested on both Raspberry Pi 4 (ARM) with DEB packages and x86 systems with RPM packages. However, please note that this project is a work in progress, and more tests are needed, especially with real ECUs. Exercise caution when using, and stay tuned for updates as development continues to enhance and stabilize the functionality.
+| Variable | Description |
+|---|---|
+| `SPEEDUINO_CONNECTION_TYPE` | `serial` or `tcp` |
+| `SPEEDUINO_PORT_NAME` | Serial device path |
+| `SPEEDUINO_TCP_HOST` / `SPEEDUINO_TCP_PORT` | TCP bridge address |
+| `SPEEDUINO_MQTT_ENABLED` | `true` / `false` |
+| `SPEEDUINO_MQTT_HOST` / `SPEEDUINO_MQTT_PORT` | Broker address |
+| `SPEEDUINO_MQTT_USERNAME` / `SPEEDUINO_MQTT_PASSWORD` | Broker credentials |
+| `SPEEDUINO_LOG_LEVEL` | `trace` \| `debug` \| `info` \| `warn` \| `error` |
 
-Feel free to reach out if you have any questions or encounter issues. Happy telemetry monitoring! 📊🛠️
+## MQTT topics
 
+All values are published to `<mqtt_base_topic><CODE>`, e.g. `/GOLF86/ECU/RPM`.
 
+### Engine basics
+| Code | Description |
+|---|---|
+| `RPM` | Engine speed (rev/min) |
+| `TPS` | Throttle position (0–255 raw) |
+| `MAP` | Manifold absolute pressure (kPa) |
+| `BAR` | Barometric pressure (kPa) |
+| `BAT` | Battery voltage (V, 1 dp) |
+| `SCL` | Loop counter (secl) |
+| `SYN` | Sync loss counter |
+
+### Temperatures
+| Code | Description |
+|---|---|
+| `IAT` | Intake air temperature (°C) |
+| `CLT` | Coolant temperature (°C) |
+| `MAT` | IAT raw byte (backward-compatible) |
+| `CAD` | Coolant raw byte (backward-compatible) |
+| `FTP` | Fuel temperature (°C) |
+
+### O2 / AFR
+| Code | Description |
+|---|---|
+| `O2P` | Primary O2 sensor |
+| `O2S` | Secondary O2 sensor |
+| `AFT` | AFR target (real units, 1 dp) |
+
+### Fuel & injection
+| Code | Description |
+|---|---|
+| `VE1` / `VE2` / `VEC` | Volumetric efficiency current / table 1 / table 2 |
+| `PW1`–`PW4` | Injector pulse width channels 1–4 (ms, 1 dp) |
+| `FLD` | Fuel load |
+| `FTC` | Fuel temp correction |
+
+### Ignition
+| Code | Description |
+|---|---|
+| `ADV` / `AD1` / `AD2` | Ignition advance (degrees) |
+| `DWL` | Dwell time (ms, 1 dp) |
+| `SPK` | Spark status bitfield |
+| `IGD` | Ignition load |
+
+### Corrections
+| Code | Description |
+|---|---|
+| `COR` | Combined corrections |
+| `BTC` | Battery correction |
+| `EGC` | EGO (O2) correction |
+| `ITC` | IAT correction |
+| `WEC` | Warm-up enrichment correction |
+| `BRC` | Baro correction |
+| `ASE` | After-start enrichment |
+| `TAE` | Transient acceleration enrichment (%) |
+
+### Flex fuel / ethanol
+| Code | Description |
+|---|---|
+| `ETH` | Ethanol % |
+| `FLC` | Flex fuel correction |
+| `FIC` | Flex ignition correction |
+| `FBC` | Flex boost correction |
+
+### Boost
+| Code | Description |
+|---|---|
+| `BST` | Boost target (kPa) |
+| `BSD` | Boost duty cycle (%) |
+
+### VVT
+| Code | Description |
+|---|---|
+| `VA1` / `VA2` | VVT 1/2 actual angle |
+| `VT1` / `VT2` | VVT 1/2 target angle |
+| `VD1` / `VD2` | VVT 1/2 duty cycle |
+
+### CAN inputs
+| Code | Description |
+|---|---|
+| `CN01`–`CN16` | CAN input channels 1–16 (u16 each) |
+
+### Miscellaneous
+| Code | Description |
+|---|---|
+| `VSS` | Vehicle speed |
+| `GER` | Current gear |
+| `FPR` | Fuel pressure |
+| `OPR` | Oil pressure |
+| `ILL` | Idle load |
+| `MPD` | MAP dot (rate of change) |
+| `TPD` | TPS dot |
+| `TAD` | TPS ADC |
+| `CIT` | Closed-loop idle target |
+| `WMI` | WMI pulse width |
+| `LPS` | Loops per second |
+| `FRM` | Free RAM |
+| `RPD` | RPM dot |
+| `TOF` | Test output flags |
+| `NER` | Next error code |
+| `STA` / `ENG` / `ST3` / `ST4` | Status bitfields |
+| `EPS` | Engine protect status |
+| `OUT` | Output status |
+| `SDS` | SD card / TunerStudio status |
+| `EMP` | EMAP pressure (published only when packet ≥ 121 bytes) |
+
+## Building packages (DEB / RPM)
+
+The `scripts/build_packages.sh` script cross-compiles the binary and assembles installable packages for **x86-64** and **arm64** using `cross`, `dpkg-deb`, and `rpmbuild`.
+
+```bash
+# Build DEB + RPM for both architectures (requires cross, dpkg-dev, rpm-build)
+./scripts/build_packages.sh
+
+# Single architecture / format
+./scripts/build_packages.sh --arch arm64 --type deb
+
+# Use local cargo toolchain instead of cross
+./scripts/build_packages.sh --no-cross
+
+# Help
+./scripts/build_packages.sh --help
+```
+
+Packages are written to `release/<version>/deb/` and `release/<version>/rpm/`.
+
+Each package:
+- Installs the binary to `/usr/bin/speeduino-to-mqtt`
+- Installs the systemd unit to `/lib/systemd/system/speeduino-to-mqtt.service`
+- Places an example config in `/etc/speeduino-to-mqtt/settings.toml.example`
+- Enables the service via `systemctl enable` in the post-install script
+
+After installation:
+
+```bash
+sudo cp /etc/speeduino-to-mqtt/settings.toml.example /etc/speeduino-to-mqtt/settings.toml
+sudo $EDITOR /etc/speeduino-to-mqtt/settings.toml
+sudo systemctl start speeduino-to-mqtt
+```
+
+## Related projects
+
+- [speeduino-serial-sim](https://github.com/askrejans/speeduino-serial-sim) – ECU data simulator for testing
+- [GPS-to-MQTT](https://github.com/askrejans/gps-to-mqtt) – companion GPS bridge
+- [G86 Web Dashboard](https://github.com/askrejans/G86-web-dashboard) – web dashboard for MQTT telemetry data
 

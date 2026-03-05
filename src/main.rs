@@ -1,319 +1,452 @@
-//! # Speeduino To MQTT Processor
+//! # Speeduino to MQTT
 //!
-//! Production-ready async application that bridges Speeduino ECU data to MQTT.
-//! Features structured logging, graceful shutdown, automatic reconnection,
-//! and comprehensive error handling.
+//! Bridges a Speeduino ECU (serial or TCP) to an MQTT broker.
+//!
+//! **Interactive mode** (TTY detected): renders a live TUI and optionally
+//! writes to MQTT when `mqtt_enabled = true`.
+//!
+//! **Service mode** (no TTY / running under systemd): structured logging to
+//! stdout, same ECU polling logic.
 
 mod config;
+mod connection;
 mod ecu_data_parser;
 mod ecu_serial_comms_handler;
 mod errors;
 mod mqtt_handler;
+mod tui;
 
-use crate::config::{load_configuration, AppConfig};
-use crate::ecu_data_parser::process_speeduino_realtime_data;
+use crate::config::{AppConfig, load_configuration};
+use crate::ecu_data_parser::{SpeeduinoData, process_speeduino_realtime_data};
 use crate::ecu_serial_comms_handler::EcuSerialHandler;
 use crate::mqtt_handler::{MqttHandler, MqttMessage};
-use gumdrop::Options;
+use crate::tui::{TuiState, TuiWriter, run_tui};
 use futures_util::stream::StreamExt;
+use gumdrop::Options;
 use signal_hook::consts::signal::*;
 use signal_hook_tokio::Signals;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use tokio::select;
-use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::sync::{RwLock, mpsc};
+use tokio::time::{Duration, interval};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-/// CLI options
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Options)]
 struct CliOptions {
     #[options(help = "print help message")]
     help: bool,
 
-    #[options(help = "Sets a custom config file", meta = "FILE")]
+    #[options(help = "path to config file (default: settings.toml)", meta = "FILE")]
     config: Option<String>,
 }
 
-/// Print usage help
 fn print_help() {
     println!("Usage: speeduino-to-mqtt [options]");
     println!();
     println!("Options:");
     println!("  -h, --help               Print this help message");
-    println!("  -c, --config FILE        Sets a custom config file path");
+    println!("  -c, --config FILE        Path to TOML config file");
     println!();
-    println!("Environment Variables:");
-    println!("  SPEEDUINO_PORT_NAME      Override serial port");
-    println!("  SPEEDUINO_MQTT_HOST      Override MQTT broker host");
-    println!("  SPEEDUINO_LOG_LEVEL      Override log level (trace|debug|info|warn|error)");
-    println!("  ... (all config options can be overridden with SPEEDUINO_ prefix)");
+    println!("Environment variables (SPEEDUINO_ prefix overrides config file):");
+    println!("  SPEEDUINO_CONNECTION_TYPE  'serial' (default) or 'tcp'");
+    println!("  SPEEDUINO_PORT_NAME        Serial device path");
+    println!("  SPEEDUINO_BAUD_RATE        Serial baud rate");
+    println!("  SPEEDUINO_TCP_HOST         TCP host (when connection_type=tcp)");
+    println!("  SPEEDUINO_TCP_PORT         TCP port (when connection_type=tcp)");
+    println!("  SPEEDUINO_MQTT_ENABLED     true/false – set false for display-only");
+    println!("  SPEEDUINO_MQTT_HOST        MQTT broker hostname");
+    println!("  SPEEDUINO_MQTT_PORT        MQTT broker port");
+    println!("  SPEEDUINO_LOG_LEVEL        trace|debug|info|warn|error");
+    println!("  .env file is loaded automatically from the working directory");
 }
 
-/// Display welcome banner
-fn display_welcome() {
-    println!("\x1b[1;32m"); // Green text
-    println!("\nWelcome to Speeduino To MQTT Processor!");
-    println!("========================================");
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
 
-    // Car logo
-    println!("\x1b[1;31m"); // Red text
+/// Set up tracing.
+///
+/// In service mode: write to stdout (JSON or pretty format per config).
+/// In TUI mode: write to a [`TuiWriter`] that feeds the on-screen log panel.
+fn init_logging_service(config: &AppConfig) {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
+
+    if config.log_json {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .init();
+    }
+}
+
+fn init_logging_tui(config: &AppConfig, writer: TuiWriter) {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(writer)
+        .init();
+}
+
+// ---------------------------------------------------------------------------
+// Signal handler
+// ---------------------------------------------------------------------------
+
+async fn wait_for_signal(mut signals: Signals, cancel: CancellationToken) {
+    while let Some(signal) = signals.next().await {
+        match signal {
+            SIGTERM | SIGINT => {
+                info!("Received shutdown signal ({})", signal);
+                cancel.cancel();
+                break;
+            }
+            _ => warn!("Unhandled signal: {}", signal),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ECU loop
+// ---------------------------------------------------------------------------
+
+async fn ecu_communication_loop(
+    config: Arc<AppConfig>,
+    mqtt_sender: Option<mpsc::Sender<MqttMessage>>,
+    tui_state: Arc<RwLock<TuiState>>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let mut handler = EcuSerialHandler::new((*config).clone());
+
+    // Initial connection with backoff
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        match handler.connect().await {
+            Ok(_) => {
+                info!("Connected to ECU: {}", config.connection_display());
+                {
+                    let mut s = tui_state.write().await;
+                    s.ecu_connected = true;
+                    s.connection_address = config.connection_display();
+                }
+                break;
+            }
+            Err(e) => {
+                error!("Failed to connect to ECU: {}", e);
+                if handler.get_retry_count() >= config.max_retry_count {
+                    error!("Max connection attempts exceeded");
+                    return Err(e.into());
+                }
+                handler.reconnect().await?;
+            }
+        }
+    }
+
+    let mut poll = interval(Duration::from_millis(config.refresh_rate_ms));
+    let mut consecutive_errors: u32 = 0;
+    const MAX_ERRORS: u32 = 10;
+
+    info!(
+        "ECU polling started at {}ms interval",
+        config.refresh_rate_ms
+    );
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("ECU loop: shutdown requested");
+                break;
+            }
+            _ = poll.tick() => {}
+        }
+
+        if !handler.check_device_exists() {
+            warn!("ECU device not found, attempting reconnect…");
+            handler.disconnect().await;
+            tui_state.write().await.ecu_connected = false;
+
+            if handler.reconnect().await.is_ok() {
+                consecutive_errors = 0;
+                tui_state.write().await.ecu_connected = true;
+            } else {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_ERRORS {
+                    return Err(anyhow::anyhow!("ECU reconnection failed too many times"));
+                }
+            }
+            continue;
+        }
+
+        match handler.read_engine_data().await {
+            Ok(data) => {
+                debug!("Read {} bytes from ECU", data.len());
+                let sender_ref = mqtt_sender.as_ref();
+                match process_speeduino_realtime_data(&data, &config, sender_ref).await {
+                    Ok(ecu_data) => {
+                        consecutive_errors = 0;
+                        handler.reset_retry_count();
+                        update_tui_ecu_data(&tui_state, ecu_data, &mqtt_sender).await;
+                    }
+                    Err(e) => {
+                        error!("Failed to process ECU data: {}", e);
+                        consecutive_errors += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to read from ECU: {}", e);
+                consecutive_errors += 1;
+                handler.disconnect().await;
+                tui_state.write().await.ecu_connected = false;
+
+                if consecutive_errors >= MAX_ERRORS {
+                    error!("Too many read errors, reconnecting…");
+                    match handler.reconnect().await {
+                        Ok(_) => {
+                            consecutive_errors = 0;
+                            tui_state.write().await.ecu_connected = true;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+        }
+    }
+
+    handler.disconnect().await;
+    Ok(())
+}
+
+async fn update_tui_ecu_data(
+    state: &Arc<RwLock<TuiState>>,
+    data: SpeeduinoData,
+    mqtt_sender: &Option<mpsc::Sender<MqttMessage>>,
+) {
+    let mut s = state.write().await;
+    s.ecu_data = Some(data);
+    if mqtt_sender.is_some() {
+        s.messages_published = s.messages_published.saturating_add(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Welcome banner (service mode only)
+// ---------------------------------------------------------------------------
+
+fn display_welcome() {
+    println!("\x1b[1;32m");
+    println!("\nWelcome to Speeduino to MQTT");
+    println!("============================");
+    println!("\x1b[1;31m");
     println!("       ______");
     println!("      //  ||\\ \\");
     println!(" ____//___||_\\ \\___");
     println!(" )  _          _    \\");
     println!(" |_/ \\________/ \\___|");
     println!("___\\_/________\\_/______");
-    println!("\x1b[1;32m"); // Green text
-
-    println!("========================================");
+    println!("\x1b[1;32m");
+    println!("============================");
     println!("Version: {}", env!("CARGO_PKG_VERSION"));
-    println!("========================================\n");
-    println!("\x1b[0m"); // Reset color
+    println!("============================\n\x1b[0m");
 }
 
-/// Initialize logging based on configuration
-fn init_logging(config: &AppConfig) {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.log_level));
-
-    if config.log_json {
-        // JSON formatted logs for production
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .json()
-            .init();
-    } else {
-        // Pretty formatted logs for development
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_target(true)
-            .init();
-    }
-
-    info!("Logging initialized at level: {}", config.log_level);
-}
-
-/// Handle system signals for graceful shutdown
-async fn handle_signals(mut signals: Signals) {
-    while let Some(signal) = signals.next().await {
-        match signal {
-            SIGTERM | SIGINT => {
-                info!("Received shutdown signal ({}), initiating graceful shutdown", signal);
-                break;
-            }
-            _ => {
-                warn!("Received unhandled signal: {}", signal);
-            }
-        }
-    }
-}
-
-/// Main ECU communication loop
-async fn ecu_communication_loop(
-    config: Arc<AppConfig>,
-    mqtt_sender: mpsc::Sender<MqttMessage>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut serial_handler = EcuSerialHandler::new((*config).clone());
-    
-    // Initial connection
-    info!("Connecting to ECU on {}", config.port_name);
-    loop {
-        match serial_handler.connect().await {
-            Ok(_) => break,
-            Err(e) => {
-                error!("Failed to connect to ECU: {}", e);
-                if serial_handler.get_retry_count() >= config.max_retry_count {
-                    error!("Max connection attempts exceeded, exiting");
-                    return Err(e.into());
-                }
-                serial_handler.reconnect().await?;
-            }
-        }
-    }
-
-    // Create polling interval
-    let mut poll_interval = interval(Duration::from_millis(config.refresh_rate_ms));
-    let mut consecutive_errors = 0;
-    const MAX_CONSECUTIVE_ERRORS: u32 = 10;
-
-    info!("Starting ECU data polling loop ({}ms interval)", config.refresh_rate_ms);
-
-    loop {
-        poll_interval.tick().await;
-
-        // Check if device still exists
-        if !serial_handler.check_device_exists() {
-            warn!("ECU device disappeared, attempting reconnection");
-            serial_handler.disconnect().await;
-            
-            match serial_handler.reconnect().await {
-                Ok(_) => {
-                    consecutive_errors = 0;
-                    continue;
-                }
-                Err(e) => {
-                    error!("Reconnection failed: {}", e);
-                    consecutive_errors += 1;
-                    
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        error!("Too many consecutive errors, exiting");
-                        return Err(e.into());
-                    }
-                    continue;
-                }
-            }
-        }
-
-        // Read data from ECU
-        match serial_handler.read_engine_data().await {
-            Ok(data) => {
-                debug!("Read {} bytes from ECU", data.len());
-                
-                // Parse and publish data
-                if let Err(e) = process_speeduino_realtime_data(
-                    &data,
-                    &config,
-                    &mqtt_sender,
-                ).await {
-                    error!("Failed to process ECU data: {}", e);
-                    consecutive_errors += 1;
-                } else {
-                    // Reset error counter on success
-                    if consecutive_errors > 0 {
-                        consecutive_errors = 0;
-                    }
-                    serial_handler.reset_retry_count();
-                }
-            }
-            Err(e) => {
-                error!("Failed to read from ECU: {}", e);
-                consecutive_errors += 1;
-                
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                    error!("Too many consecutive read errors, attempting reconnection");
-                    serial_handler.disconnect().await;
-                    
-                    if let Err(e) = serial_handler.reconnect().await {
-                        error!("Reconnection failed: {}", e);
-                        return Err(e.into());
-                    }
-                    consecutive_errors = 0;
-                }
-            }
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse CLI arguments
+async fn main() -> anyhow::Result<()> {
     let opts = CliOptions::parse_args_default_or_exit();
-
     if opts.help {
         print_help();
         std::process::exit(0);
     }
 
-    // Display welcome banner
-    display_welcome();
-
-    // Load configuration
-    info!("Loading configuration...");
+    // Load config (also loads .env file via dotenvy)
     let config = match load_configuration(opts.config.as_deref()) {
-        Ok(cfg) => Arc::new(cfg),
+        Ok(c) => Arc::new(c),
         Err(e) => {
-            eprintln!("Failed to load configuration: {}", e);
+            eprintln!("Failed to load config: {}", e);
             std::process::exit(1);
         }
     };
 
-    // Initialize logging
-    init_logging(&config);
-    
-    // Display configuration summary
-    config.display_summary();
+    // Shared cancellation token
+    let cancel = CancellationToken::new();
 
-    // Setup signal handlers for graceful shutdown
-    let signals = Signals::new(&[SIGTERM, SIGINT])?;
-    let signals_handle = signals.handle();
-    let signals_task = tokio::spawn(handle_signals(signals));
+    // Detect whether stdin is a TTY – show TUI when running interactively
+    let is_tty = atty::is(atty::Stream::Stdout);
 
-    // Create MQTT handler
-    info!("Setting up MQTT connection...");
-    let mut mqtt_handler = match MqttHandler::new(config.clone()) {
-        Ok(handler) => handler,
-        Err(e) => {
-            error!("Failed to create MQTT handler: {}", e);
-            return Err(e.into());
-        }
-    };
+    // Shared state for TUI
+    let log_buffer: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let tui_state: Arc<RwLock<TuiState>> = Arc::new(RwLock::new(TuiState {
+        mqtt_enabled: config.mqtt_enabled,
+        connection_address: config.connection_display(),
+        mqtt_address: if config.mqtt_enabled {
+            format!("{}:{}", config.mqtt_host, config.mqtt_port)
+        } else {
+            String::new()
+        },
+        ..TuiState::default()
+    }));
 
-    // Connect to MQTT broker
-    if let Err(e) = mqtt_handler.connect().await {
-        error!("Failed to connect to MQTT broker: {}", e);
-        return Err(e.into());
+    // Init logging – in TUI mode write to the shared log buffer
+    if is_tty {
+        let writer = TuiWriter::new(Arc::clone(&log_buffer));
+        init_logging_tui(&config, writer);
+    } else {
+        display_welcome();
+        init_logging_service(&config);
     }
 
-    // Get MQTT message sender
-    let mqtt_sender = mqtt_handler.get_sender();
+    info!(
+        "Configuration loaded; connection={}",
+        config.connection_display()
+    );
 
-    // Start ECU communication loop
-    let ecu_config = config.clone();
-    let ecu_sender = mqtt_sender.clone();
+    // Signal handler
+    let signals = Signals::new([SIGTERM, SIGINT])?;
+    let signals_handle = signals.handle();
+    let signals_cancel = cancel.clone();
+    let signals_task = tokio::spawn(wait_for_signal(signals, signals_cancel));
+
+    // Optional MQTT setup — handler must stay on the main task (paho futures are !Send)
+    let (mqtt_sender, mqtt_handler_opt): (Option<mpsc::Sender<MqttMessage>>, Option<MqttHandler>) =
+        if config.mqtt_enabled {
+            info!(
+                "Setting up MQTT connection to {}:{}",
+                config.mqtt_host, config.mqtt_port
+            );
+            match MqttHandler::new(config.clone()) {
+                Ok(mut handler) => match handler.connect().await {
+                    Ok(_) => {
+                        info!("MQTT connected");
+                        tui_state.write().await.mqtt_connected = true;
+                        let sender = handler.get_sender();
+                        (Some(sender), Some(handler))
+                    }
+                    Err(e) => {
+                        error!("Failed to connect to MQTT broker: {}", e);
+                        if !is_tty {
+                            return Err(e.into());
+                        }
+                        warn!("Continuing without MQTT (display-only mode)");
+                        (None, None)
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to create MQTT handler: {}", e);
+                    return Err(e.into());
+                }
+            }
+        } else {
+            info!("MQTT disabled – ECU data will be displayed in TUI only");
+            (None, None)
+        };
+
+    // ECU communication task
+    let ecu_config = Arc::clone(&config);
+    let ecu_state = Arc::clone(&tui_state);
+    let ecu_cancel = cancel.clone();
     let ecu_task = tokio::spawn(async move {
-        if let Err(e) = ecu_communication_loop(ecu_config, ecu_sender).await {
-            error!("ECU communication loop failed: {}", e);
+        if let Err(e) = ecu_communication_loop(ecu_config, mqtt_sender, ecu_state, ecu_cancel).await
+        {
+            error!("ECU loop exited with error: {}", e);
         }
     });
 
-    info!("All tasks started successfully");
-    info!("Press Ctrl+C to shutdown");
+    // TUI task (interactive mode only)
+    let tui_task = if is_tty {
+        let ts = Arc::clone(&tui_state);
+        let lb = Arc::clone(&log_buffer);
+        let tc = cancel.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = run_tui(ts, lb, tc).await {
+                error!("TUI error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
 
-    // Wait for shutdown signal or task completion
+    info!("All tasks running. Press Ctrl+C to stop.");
+
+    // Drive the MQTT publish task directly on the main task (paho futures are !Send).
+    // ECU and TUI tasks are spawned because they only use Send types.
     select! {
-        _ = signals_task => {
+        _ = cancel.cancelled() => {
             info!("Shutdown signal received");
         }
         _ = ecu_task => {
-            warn!("ECU task terminated unexpectedly");
+            warn!("ECU task terminated; shutting down");
+            cancel.cancel();
         }
-        result = mqtt_handler.start_publishing_task() => {
-            match result {
-                Ok(_) => info!("MQTT task completed"),
-                Err(e) => error!("MQTT task failed: {}", e),
+        result = async {
+            if let Some(handler) = mqtt_handler_opt {
+                handler.start_publishing_task().await
+            } else {
+                std::future::pending::<crate::errors::Result<()>>().await
             }
+        } => {
+            match result {
+                Ok(_)  => info!("MQTT publish task completed"),
+                Err(e) => error!("MQTT publish task error: {}", e),
+            }
+            tui_state.write().await.mqtt_connected = false;
+            cancel.cancel();
         }
     }
 
-    // Cleanup
-    info!("Shutting down gracefully...");
+    // Wait for TUI to finish restoring the terminal
+    if let Some(t) = tui_task {
+        let _ = t.await;
+    }
+
     signals_handle.close();
-    
+    let _ = signals_task.await;
+
     info!("Goodbye!");
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_display_welcome() {
-        // Should not panic
-        display_welcome();
-    }
-
-    #[test]
-    fn test_print_help() {
-        // Should not panic
+    fn test_print_help_no_panic() {
         print_help();
     }
 
     #[test]
-    fn test_cli_options_parsing() {
-        let args = vec!["program", "--help"];
-        let opts = CliOptions::parse_args(&args[1..], gumdrop::ParsingStyle::default());
+    fn test_display_welcome_no_panic() {
+        display_welcome();
+    }
+
+    #[test]
+    fn test_cli_options_help_flag() {
+        let args = ["--help"];
+        let opts = CliOptions::parse_args(&args, gumdrop::ParsingStyle::default());
         assert!(opts.is_ok());
+        assert!(opts.unwrap().help);
     }
 }

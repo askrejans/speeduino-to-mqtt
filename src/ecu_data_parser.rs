@@ -1,908 +1,1048 @@
+//! Speeduino ECU data parser.
+//!
+//! Implements the Speeduino 'A' command realtime-data protocol.
+//!
+//! **Wire format**: primary-serial 'A' command — byte layout from `getTSLogEntry()` in
+//! <https://github.com/speeduino/speeduino/blob/master/speeduino/logger.cpp>.
+//!
+//! | Packet size | Source |
+//! |-------------|--------|
+//! | 138 bytes   | Real Speeduino ECU (current firmware, `LOG_ENTRY_SIZE = 138`) |
+//! | 130 bytes   | speeduino-serial-sim (identical layout, missing PW5–PW8 at bytes 130–137) |
+//!
+//! **Note**: the secondary-serial 'A' command (75 bytes) uses an incompatible byte layout
+//! and is NOT supported here. Connect via the primary serial interface (USB or TCP/WiFi bridge).
+//!
+//! All multi-byte values in the Speeduino protocol are **little-endian** (low byte first).
+//! Temperatures are stored with a +40 offset to fit in an unsigned byte; call the
+//! helper methods (e.g. [`SpeeduinoData::iat_celsius()`]) to get the real value.
+
 use crate::config::AppConfig;
 use crate::errors::{ParseError, Result};
-use crate::mqtt_handler::{build_topic_path, MqttMessage};
+use crate::mqtt_handler::{MqttMessage, build_topic_path};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-// Data validation constants (conservative ranges)
-const RPM_MAX: u16 = 15000;
+// ---------------------------------------------------------------------------
+// Validation constants
+// ---------------------------------------------------------------------------
+const RPM_MAX: u16 = 15_000;
 const TEMP_MIN: i16 = -40;
 const TEMP_MAX: i16 = 200;
 const MAP_MAX: u16 = 400; // kPa
-const TPS_MAX: u8 = 100;  // %
-const BATTERY_MIN: f32 = 8.0;  // V
+const TPS_MAX: u8 = 100; // %
+const BATTERY_MIN: f32 = 8.0; // V
 const BATTERY_MAX: f32 = 18.0; // V
-const PRESSURE_MAX: u16 = 1000; // kPa (fuel/oil pressure)
 
-/// Represents the Speeduino ECU data structure.
-#[derive(Debug)]
-struct SpeeduinoData {
-    secl: u8,                       // Counter for +1s
-    status1: u8,                    // Status byte 1
-    engine: u8,                     // Engine status
-    dwell: u8,                      // Dwell time
-    map_low: u8,                    // Low byte of MAP sensor reading
-    map_high: u8,                   // High byte of MAP sensor reading
-    mat: u8,                        // Manifold Air Temperature sensor reading
-    coolant_adc: u8,                // Coolant Analog-to-Digital Conversion value
-    bat_correction: u8,             // Battery correction
-    battery_10: u8,                 // Battery voltage * 10
-    o2_primary: u8,                 // Primary O2 sensor reading
-    ego_correction: u8,             // EGO Correction
-    iat_correction: u8,             // IAT Correction
-    wue_correction: u8,             // Warm-Up Enrichment Correction
-    rpm_low: u8,                    // Low byte of RPM
-    rpm_high: u8,                   // High byte of RPM
-    tae_amount: u8,                 // TAE Amount
-    corrections: u8,                // Corrections
-    ve: u8,                         // Volumetric Efficiency
-    afr_target: u8,                 // AFR Target
-    pw1_low: u8,                    // Low byte of Pulse Width 1
-    pw1_high: u8,                   // High byte of Pulse Width 1
-    tps_dot: u8,                    // Throttle Position Sensor change per second
-    advance: u8,                    // Ignition Advance
-    tps: u8,                        // Throttle Position Sensor reading
-    loops_per_second_low: u8,       // Low byte of loops per second
-    loops_per_second_high: u8,      // High byte of loops per second
-    free_ram_low: u8,               // Low byte of free RAM
-    free_ram_high: u8,              // High byte of free RAM
-    boost_target: u8,               // Boost Target
-    boost_duty: u8,                 // Boost Duty
-    spark: u8,                      // Spark
-    rpm_dot_low: u8,                // Low byte of RPM DOT (assuming signed integer)
-    rpm_dot_high: u8,               // High byte of RPM DOT (assuming signed integer)
-    ethanol_pct: u8,                // Ethanol Percentage
-    flex_correction: u8,            // Flex Fuel Correction
-    flex_ign_correction: u8,        // Flex Fuel Ignition Correction
-    idle_load: u8,                  // Idle Load
-    test_outputs: u8,               // Test Outputs
-    o2_secondary: u8,               // Secondary O2 sensor reading
-    baro: u8,                       // Barometric Pressure
-    canin: [u8; 16],                // CAN Input values
-    tps_adc: u8,                    // Throttle Position Sensor ADC value
-    next_error: u8,                 // Next Error
-    launch_correction: u8,          // Launch control correction
-    pw2_low: u8,                    // Low byte of Pulse Width 2
-    pw2_high: u8,                   // High byte of Pulse Width 2
-    pw3_low: u8,                    // Low byte of Pulse Width 3
-    pw3_high: u8,                   // High byte of Pulse Width 3
-    pw4_low: u8,                    // Low byte of Pulse Width 4
-    pw4_high: u8,                   // High byte of Pulse Width 4
-    status3: u8,                    // Status3 bitfield
-    engine_protect_status: u8,      // Engine protection status
-    fuel_load_low: u8,              // Low byte of fuel load
-    fuel_load_high: u8,             // High byte of fuel load
-    ign_load_low: u8,               // Low byte of ignition load
-    ign_load_high: u8,              // High byte of ignition load
-    inj_angle_low: u8,              // Low byte of injection angle
-    inj_angle_high: u8,             // High byte of injection angle
-    idle_duty: u8,                  // Idle duty cycle
-    cl_idle_target: u8,             // Closed loop idle target
-    map_dot: u8,                    // MAP rate of change
-    vvt1_angle: i8,                 // VVT1 angle
-    vvt1_target_angle: u8,          // VVT1 target angle
-    vvt1_duty: u8,                  // VVT1 duty cycle
-    flex_boost_correction_low: u8,  // Low byte of flex boost correction
-    flex_boost_correction_high: u8, // High byte of flex boost correction
-    baro_correction: u8,            // Barometric pressure correction
-    ase_value: u8,                  // Current ASE value
-    vss_low: u8,                    // Low byte of vehicle speed
-    vss_high: u8,                   // High byte of vehicle speed
-    gear: u8,                       // Current gear
-    fuel_pressure: u8,              // Fuel pressure
-    oil_pressure: u8,               // Oil pressure
-    wmi_pw: u8,                     // Water-methanol injection pulse width
-    status4: u8,                    // Status4 bitfield
-    vvt2_angle: i8,                 // VVT2 angle
-    vvt2_target_angle: u8,          // VVT2 target angle
-    vvt2_duty: u8,                  // VVT2 duty cycle
-    outputs_status: u8,             // Outputs status
-    fuel_temp: u8,                  // Fuel temperature
-    fuel_temp_correction: u8,       // Fuel temperature correction
-    ve1: u8,                        // VE table 1 value
-    ve2: u8,                        // VE table 2 value
-    advance1: u8,                   // Advance table 1 value
-    advance2: u8,                   // Advance table 2 value
-    nitrous_status: u8,             // Nitrous system status
-    ts_sd_status: u8,               // SD card status
+// ---------------------------------------------------------------------------
+// Data structure
+// ---------------------------------------------------------------------------
+
+/// Parsed Speeduino realtime data from the 'A' command response.
+///
+/// Field names, byte offsets, and units follow the wiki protocol specification.
+/// Multi-byte values are pre-combined and stored in their natural Rust types.
+#[derive(Debug, Clone, Default)]
+pub struct SpeeduinoData {
+    /// Byte 0 – seconds counter (resets to 0 on ECU reset)
+    pub secl: u8,
+    /// Byte 1 – status1 bitfield
+    pub status1: u8,
+    /// Byte 2 – engine status bitfield
+    pub engine: u8,
+    /// Byte 3 – sync-loss counter
+    pub sync_loss_counter: u8,
+
+    /// Bytes 4–5 – MAP sensor (kPa, little-endian u16)
+    pub map: u16,
+    /// Byte 6 – IAT raw (stored as `actual_°C + 40`)
+    pub iat_raw: u8,
+    /// Byte 7 – coolant raw (stored as `actual_°C + 40`)
+    pub coolant_raw: u8,
+    /// Byte 8 – battery voltage correction (%)
+    pub bat_correction: u8,
+    /// Byte 9 – battery voltage × 10  (e.g. 142 = 14.2 V)
+    pub battery_10: u8,
+    /// Byte 10 – primary O2 sensor
+    pub o2_primary: u8,
+    /// Byte 11 – EGO correction (%)
+    pub ego_correction: u8,
+    /// Byte 12 – IAT fuel correction (%)
+    pub iat_correction: u8,
+    /// Byte 13 – warm-up enrichment correction (%)
+    pub wue_correction: u8,
+
+    /// Bytes 14–15 – engine speed (RPM, little-endian u16)
+    pub rpm: u16,
+    /// Byte 16 – TAE / accel-enrichment amount (stored >> 1; × 2 for actual %)
+    pub tae_amount_raw: u8,
+    /// Bytes 17–18 – total fuel/ignition corrections (gamma-E, little-endian u16, %)
+    pub corrections: u16,
+
+    /// Byte 19 – VE table 1 (%)
+    pub ve1: u8,
+    /// Byte 20 – VE table 2 (%)
+    pub ve2: u8,
+    /// Byte 21 – AFR target (stored × 10, e.g. 147 = 14.7)
+    pub afr_target: u8,
+    /// Bytes 22–23 – TPS rate of change (% × 10 per 100 ms, little-endian u16)
+    pub tps_dot: u16,
+    /// Byte 24 – ignition advance (degrees BTDC)
+    pub advance: u8,
+    /// Byte 25 – throttle position (0–100 %)
+    pub tps: u8,
+
+    /// Bytes 26–27 – MCU loops per second (little-endian u16)
+    pub loops_per_second: u16,
+    /// Bytes 28–29 – free RAM bytes (little-endian u16)
+    pub free_ram: u16,
+
+    /// Byte 30 – boost target (stored >> 1; × 2 for actual kPa)
+    pub boost_target_raw: u8,
+    /// Byte 31 – boost solenoid duty (stored / 100; × 100 for actual %)
+    pub boost_duty_raw: u8,
+    /// Byte 32 – spark status bitfield
+    pub spark: u8,
+
+    /// Bytes 33–34 – RPM rate of change (little-endian i16)
+    pub rpm_dot: i16,
+    /// Byte 35 – ethanol / flex-fuel percentage (0–100 %)
+    pub ethanol_pct: u8,
+    /// Byte 36 – flex-fuel fuel correction (%)
+    pub flex_correction: u8,
+    /// Byte 37 – flex-fuel ignition correction (degrees)
+    pub flex_ign_correction: u8,
+    /// Byte 38 – idle load
+    pub idle_load: u8,
+    /// Byte 39 – test outputs bitfield
+    pub test_outputs: u8,
+    /// Byte 40 – secondary O2 sensor
+    pub o2_secondary: u8,
+    /// Byte 41 – barometric pressure (kPa)
+    pub baro: u8,
+
+    /// Bytes 42–73 – CAN inputs (16 channels, each a little-endian u16)
+    pub canin: [u16; 16],
+
+    /// Byte 74 – TPS ADC raw value
+    pub tps_adc: u8,
+    /// Byte 75 – next error code
+    pub next_error: u8,
+
+    /// Bytes 76–77 – injector pulse width 1 (µs / 10, little-endian u16)
+    pub pw1: u16,
+    /// Bytes 78–79 – injector pulse width 2
+    pub pw2: u16,
+    /// Bytes 80–81 – injector pulse width 3
+    pub pw3: u16,
+    /// Bytes 82–83 – injector pulse width 4
+    pub pw4: u16,
+
+    /// Byte 84 – status3 bitfield
+    pub status3: u8,
+    /// Byte 85 – engine protection status
+    pub engine_protect_status: u8,
+
+    /// Bytes 86–87 – fuel load (little-endian u16)
+    pub fuel_load: u16,
+    /// Bytes 88–89 – ignition load (little-endian u16)
+    pub ign_load: u16,
+    /// Bytes 90–91 – dwell time (0.1 ms units, little-endian u16)
+    pub dwell: u16,
+
+    /// Byte 92 – closed-loop idle target
+    pub cl_idle_target: u8,
+    /// Bytes 93–94 – MAP rate of change (kPa × 10 per 100 ms, little-endian u16)
+    pub map_dot: u16,
+
+    /// Bytes 95–96 – VVT1 cam angle (little-endian i16, degrees)
+    pub vvt1_angle: i16,
+    /// Byte 97 – VVT1 target angle (degrees)
+    pub vvt1_target_angle: u8,
+    /// Byte 98 – VVT1 solenoid duty (%)
+    pub vvt1_duty: u8,
+
+    /// Bytes 99–100 – flex-fuel boost correction (little-endian u16)
+    pub flex_boost_correction: u16,
+    /// Byte 101 – barometric pressure correction (%)
+    pub baro_correction: u8,
+    /// Byte 102 – current effective VE (blended from VE1/VE2, %)
+    pub ve_current: u8,
+    /// Byte 103 – after-start enrichment value (%)
+    pub ase_value: u8,
+
+    /// Bytes 104–105 – vehicle speed (km/h, little-endian u16)
+    pub vss: u16,
+    /// Byte 106 – current gear
+    pub gear: u8,
+    /// Byte 107 – fuel pressure (kPa)
+    pub fuel_pressure: u8,
+    /// Byte 108 – oil pressure (kPa)
+    pub oil_pressure: u8,
+    /// Byte 109 – water-methanol injection pulse width
+    pub wmi_pw: u8,
+    /// Byte 110 – status4 bitfield
+    pub status4: u8,
+
+    /// Bytes 111–112 – VVT2 cam angle (little-endian i16, degrees)
+    pub vvt2_angle: i16,
+    /// Byte 113 – VVT2 target angle (degrees)
+    pub vvt2_target_angle: u8,
+    /// Byte 114 – VVT2 solenoid duty (%)
+    pub vvt2_duty: u8,
+
+    /// Byte 115 – outputs status bitfield
+    pub outputs_status: u8,
+    /// Byte 116 – fuel temperature raw (stored as `actual_°C + 40`)
+    pub fuel_temp_raw: u8,
+    /// Byte 117 – fuel temperature correction (%)
+    pub fuel_temp_correction: u8,
+    /// Byte 118 – advance table 1 (degrees)
+    pub advance1: u8,
+    /// Byte 119 – advance table 2 (degrees)
+    pub advance2: u8,
+    /// Byte 120 – TunerStudio SD card status
+    pub ts_sd_status: u8,
+
+    /// Bytes 121–122 – EMAP sensor (kPa, little-endian u16).
+    /// Present when packet ≥ 123 bytes (always in valid 130-byte primary-serial packets).
+    pub emap: Option<u16>,
+
+    // ---- Extended fields (bytes 123–129): present in all 130-byte packets ----
+    /// Byte 123 – radiator fan duty cycle (%)
+    pub fan_duty: Option<u8>,
+    /// Byte 124 – air conditioning status bitfield
+    pub air_con_status: Option<u8>,
+    /// Bytes 125–126 – actual (measured) dwell time (0.1 ms units, little-endian u16)
+    pub actual_dwell: Option<u16>,
+    /// Byte 127 – status5 bitfield
+    pub status5: Option<u8>,
+    /// Byte 128 – knock event counter
+    pub knock_count: Option<u8>,
+    /// Byte 129 – knock retard (degrees)
+    pub knock_retard: Option<u8>,
+
+    // ---- PW5–PW8 (bytes 130–137): current firmware only (138-byte packets) ----
+    /// Bytes 130–131 – injector pulse width 5 (µs / 10, little-endian u16)
+    pub pw5: Option<u16>,
+    /// Bytes 132–133 – injector pulse width 6
+    pub pw6: Option<u16>,
+    /// Bytes 134–135 – injector pulse width 7
+    pub pw7: Option<u16>,
+    /// Bytes 136–137 – injector pulse width 8
+    pub pw8: Option<u16>,
 }
 
-/// Process and publish the received Speeduino ECU data
+impl SpeeduinoData {
+    pub fn iat_celsius(&self) -> i16 {
+        self.iat_raw as i16 - 40
+    }
+    pub fn coolant_celsius(&self) -> i16 {
+        self.coolant_raw as i16 - 40
+    }
+    pub fn fuel_temp_celsius(&self) -> i16 {
+        self.fuel_temp_raw as i16 - 40
+    }
+    pub fn battery_voltage(&self) -> f32 {
+        self.battery_10 as f32 / 10.0
+    }
+    pub fn afr_target_real(&self) -> f32 {
+        self.afr_target as f32 / 10.0
+    }
+    pub fn tae_amount_pct(&self) -> u16 {
+        self.tae_amount_raw as u16 * 2
+    }
+    pub fn boost_target_kpa(&self) -> u16 {
+        self.boost_target_raw as u16 * 2
+    }
+    pub fn boost_duty_pct(&self) -> u32 {
+        self.boost_duty_raw as u32 * 100
+    }
+    pub fn pw1_ms(&self) -> f32 {
+        self.pw1 as f32 / 10.0
+    }
+    pub fn pw2_ms(&self) -> f32 {
+        self.pw2 as f32 / 10.0
+    }
+    pub fn pw3_ms(&self) -> f32 {
+        self.pw3 as f32 / 10.0
+    }
+    pub fn pw4_ms(&self) -> f32 {
+        self.pw4 as f32 / 10.0
+    }
+    pub fn dwell_ms(&self) -> f32 {
+        self.dwell as f32 / 10.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Parse raw bytes into [`SpeeduinoData`] without publishing to MQTT.
+#[allow(dead_code)]
+pub fn get_parsed_data(data: &[u8]) -> Result<SpeeduinoData> {
+    parse_realtime_data(data)
+}
+
+/// Parse ECU data and optionally publish all parameters to MQTT.
 ///
-/// # Arguments
-///
-/// * `data` - A slice of bytes representing received data.
-/// * `config` - The Arc<AppConfig> instance.
-/// * `mqtt_sender` - The MQTT message channel sender.
+/// When `mqtt_sender` is `None` (MQTT disabled), only parsing happens – no
+/// network I/O takes place.  Returns the parsed struct so callers (e.g. the
+/// TUI) can display it.
 pub async fn process_speeduino_realtime_data(
     data: &[u8],
     config: &Arc<AppConfig>,
-    mqtt_sender: &mpsc::Sender<MqttMessage>,
-) -> Result<()> {
-    // Validate data length
-    if data.len() < config.expected_data_length {
-        warn!("Invalid data received. Expected {} bytes, got {}",
-            config.expected_data_length, data.len());
+    mqtt_sender: Option<&mpsc::Sender<MqttMessage>>,
+) -> Result<SpeeduinoData> {
+    // Minimum for primary-serial packets (both sim=130 and real firmware=138).
+    // Secondary-serial 'A' (75 bytes) uses an incompatible layout — not supported.
+    const MIN_BYTES: usize = 130;
+
+    if data.len() < MIN_BYTES {
+        warn!(
+            "Packet too short: expected ≥{} bytes, got {}. \
+             Ensure you are connected to the primary serial interface (USB/TCP bridge). \
+             The secondary-serial 'A' response (75 bytes) uses an incompatible layout.",
+            MIN_BYTES,
+            data.len()
+        );
         return Err(ParseError::InsufficientData {
-            expected: config.expected_data_length,
+            expected: MIN_BYTES,
             actual: data.len(),
-        }.into());
-    }
-
-    debug!("Parsing {} bytes of ECU data", data.len());
-
-    // Parse the Realtime Data List
-    let speeduino_data = parse_realtime_data(data)?;
-
-    // Publish all parameters to MQTT
-    publish_speeduino_params_to_mqtt(mqtt_sender, config, &speeduino_data).await?;
-
-    Ok(())
-}
-
-/// Combines two bytes into a single `u16` value.
-///
-/// This function takes two bytes, a low byte and a high byte, and combines
-/// them into a single 16-bit unsigned integer. The low byte is placed in the
-/// lower 8 bits of the result, and the high byte is placed in the upper 8 bits.
-///
-/// # Arguments
-///
-/// * `low` - The low byte.
-/// * `high` - The high byte.
-///
-/// # Returns
-///
-/// A `u16` value that combines the low and high bytes.
-///
-/// # Example
-///
-/// ```
-/// let low = 0x34;
-/// let high = 0x12;
-/// let combined = combine_bytes(low, high);
-/// assert_eq!(combined, 0x1234);
-/// ```
-fn combine_bytes(high: u8, low: u8) -> u16 {
-    ((high as u16) << 8) | (low as u16)
-}
-
-/// Validates critical ECU data parameters against safe operating ranges.
-/// 
-/// Logs warnings for out-of-range values but doesn't fail parsing.
-/// This allows the system to continue operating while alerting about suspicious data.
-fn validate_data(data: &SpeeduinoData) -> Result<()> {
-    // Validate RPM
-    let rpm = combine_bytes(data.rpm_high, data.rpm_low);
-    if rpm > RPM_MAX {
-        warn!("RPM out of range: {} (max: {})", rpm, RPM_MAX);
-    }
-    
-    // Validate coolant temperature (-40 to +200°C)
-    let coolant_temp = data.coolant_adc as i16 - 40;
-    if coolant_temp < TEMP_MIN || coolant_temp > TEMP_MAX {
-        warn!("Coolant temp out of range: {}°C (range: {} to {})", 
-              coolant_temp, TEMP_MIN, TEMP_MAX);
-    }
-    
-    // Validate MAT temperature
-    let mat_temp = data.mat as i16 - 40;
-    if mat_temp < TEMP_MIN || mat_temp > TEMP_MAX {
-        warn!("MAT temp out of range: {}°C (range: {} to {})", 
-              mat_temp, TEMP_MIN, TEMP_MAX);
-    }
-    
-    // Validate MAP sensor
-    let map = combine_bytes(data.map_high, data.map_low);
-    if map > MAP_MAX {
-        warn!("MAP out of range: {} kPa (max: {})", map, MAP_MAX);
-    }
-    
-    // Validate TPS
-    if data.tps > TPS_MAX {
-        warn!("TPS out of range: {}% (max: {})", data.tps, TPS_MAX);
-    }
-    
-    // Validate battery voltage (allow 0V for disconnected battery)
-    let battery_voltage = data.battery_10 as f32 / 10.0;
-    if battery_voltage > 0.0 && (battery_voltage < BATTERY_MIN || battery_voltage > BATTERY_MAX) {
-        warn!("Battery voltage out of range: {}V (range: {} to {})", 
-              battery_voltage, BATTERY_MIN, BATTERY_MAX);
-    }
-    
-    // Validate fuel pressure (single byte, 0-255 kPa range)
-    if data.fuel_pressure as u16 > PRESSURE_MAX {
-        warn!("Fuel pressure out of range: {} kPa (max: {})", data.fuel_pressure, PRESSURE_MAX);
-    }
-    
-    // Validate oil pressure (single byte, 0-255 kPa range)
-    if data.oil_pressure as u16 > PRESSURE_MAX {
-        warn!("Oil pressure out of range: {} kPa (max: {})", data.oil_pressure, PRESSURE_MAX);
-    }
-    
-    // Validate fuel temperature
-    let fuel_temp = data.fuel_temp as i16 - 40;
-    if fuel_temp < TEMP_MIN || fuel_temp > TEMP_MAX {
-        warn!("Fuel temp out of range: {}°C (range: {} to {})", 
-              fuel_temp, TEMP_MIN, TEMP_MAX);
-    }
-    
-    debug!("Data validation passed");
-    Ok(())
-}
-
-/// Parses the Realtime Data List and creates a `SpeeduinoData` instance.
-///
-/// This function reads a byte slice and extracts various fields to populate
-/// a `SpeeduinoData` structure. It uses an internal helper function to read
-/// individual bytes from the data slice.
-///
-/// # Arguments
-///
-/// * `data` - A byte slice containing the realtime data to be parsed.
-///
-/// # Returns
-///
-/// A `SpeeduinoData` instance populated with the parsed data.
-///
-/// # Example
-///
-/// ```
-/// let data: &[u8] = &[0x01, 0x02, 0x03, ...];
-/// let speeduino_data = parse_realtime_data(data);
-/// ```
-#[allow(unused_assignments)]
-fn parse_realtime_data(data: &[u8]) -> Result<SpeeduinoData> {
-    let mut offset = 0;
-
-    fn read_byte(data: &[u8], offset: &mut usize) -> Result<u8> {
-        if *offset < data.len() {
-            let value = data[*offset];
-            *offset += 1;
-            Ok(value)
-        } else {
-            Err(ParseError::InsufficientData {
-                expected: *offset + 1,
-                actual: data.len(),
-            }.into())
         }
+        .into());
     }
 
-    // Create a SpeeduinoData instance by reading each field
-    let speeduino_data = SpeeduinoData {
-        secl: read_byte(data, &mut offset)?,
-        status1: read_byte(data, &mut offset)?,
-        engine: read_byte(data, &mut offset)?,
-        dwell: read_byte(data, &mut offset)?,
-        map_low: read_byte(data, &mut offset)?,
-        map_high: read_byte(data, &mut offset)?,
-        mat: read_byte(data, &mut offset)?,
-        coolant_adc: read_byte(data, &mut offset)?,
-        bat_correction: read_byte(data, &mut offset)?,
-        battery_10: read_byte(data, &mut offset)?,
-        o2_primary: read_byte(data, &mut offset)?,
-        ego_correction: read_byte(data, &mut offset)?,
-        iat_correction: read_byte(data, &mut offset)?,
-        wue_correction: read_byte(data, &mut offset)?,
-        rpm_low: read_byte(data, &mut offset)?,
-        rpm_high: read_byte(data, &mut offset)?,
-        tae_amount: read_byte(data, &mut offset)?,
-        corrections: read_byte(data, &mut offset)?,
-        ve: read_byte(data, &mut offset)?,
-        afr_target: read_byte(data, &mut offset)?,
-        pw1_low: read_byte(data, &mut offset)?,
-        pw1_high: read_byte(data, &mut offset)?,
-        tps_dot: read_byte(data, &mut offset)?,
-        advance: read_byte(data, &mut offset)?,
-        tps: read_byte(data, &mut offset)?,
-        loops_per_second_low: read_byte(data, &mut offset)?,
-        loops_per_second_high: read_byte(data, &mut offset)?,
-        free_ram_low: read_byte(data, &mut offset)?,
-        free_ram_high: read_byte(data, &mut offset)?,
-        boost_target: read_byte(data, &mut offset)?,
-        boost_duty: read_byte(data, &mut offset)?,
-        spark: read_byte(data, &mut offset)?,
-        rpm_dot_low: read_byte(data, &mut offset)?,
-        rpm_dot_high: read_byte(data, &mut offset)?,
-        ethanol_pct: read_byte(data, &mut offset)?,
-        flex_correction: read_byte(data, &mut offset)?,
-        flex_ign_correction: read_byte(data, &mut offset)?,
-        idle_load: read_byte(data, &mut offset)?,
-        test_outputs: read_byte(data, &mut offset)?,
-        o2_secondary: read_byte(data, &mut offset)?,
-        baro: read_byte(data, &mut offset)?,
-        canin: [
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-            read_byte(data, &mut offset)?,
-        ],
-        tps_adc: read_byte(data, &mut offset)?,
-        next_error: read_byte(data, &mut offset)?,
-        launch_correction: read_byte(data, &mut offset)?,
-        pw2_low: read_byte(data, &mut offset)?,
-        pw2_high: read_byte(data, &mut offset)?,
-        pw3_low: read_byte(data, &mut offset)?,
-        pw3_high: read_byte(data, &mut offset)?,
-        pw4_low: read_byte(data, &mut offset)?,
-        pw4_high: read_byte(data, &mut offset)?,
-        status3: read_byte(data, &mut offset)?,
-        engine_protect_status: read_byte(data, &mut offset)?,
-        fuel_load_low: read_byte(data, &mut offset)?,
-        fuel_load_high: read_byte(data, &mut offset)?,
-        ign_load_low: read_byte(data, &mut offset)?,
-        ign_load_high: read_byte(data, &mut offset)?,
-        inj_angle_low: read_byte(data, &mut offset)?,
-        inj_angle_high: read_byte(data, &mut offset)?,
-        idle_duty: read_byte(data, &mut offset)?,
-        cl_idle_target: read_byte(data, &mut offset)?,
-        map_dot: read_byte(data, &mut offset)?,
-        vvt1_angle: read_byte(data, &mut offset)? as i8,
-        vvt1_target_angle: read_byte(data, &mut offset)?,
-        vvt1_duty: read_byte(data, &mut offset)?,
-        flex_boost_correction_low: read_byte(data, &mut offset)?,
-        flex_boost_correction_high: read_byte(data, &mut offset)?,
-        baro_correction: read_byte(data, &mut offset)?,
-        ase_value: read_byte(data, &mut offset)?,
-        vss_low: read_byte(data, &mut offset)?,
-        vss_high: read_byte(data, &mut offset)?,
-        gear: read_byte(data, &mut offset)?,
-        fuel_pressure: read_byte(data, &mut offset)?,
-        oil_pressure: read_byte(data, &mut offset)?,
-        wmi_pw: read_byte(data, &mut offset)?,
-        status4: read_byte(data, &mut offset)?,
-        vvt2_angle: read_byte(data, &mut offset)? as i8,
-        vvt2_target_angle: read_byte(data, &mut offset)?,
-        vvt2_duty: read_byte(data, &mut offset)?,
-        outputs_status: read_byte(data, &mut offset)?,
-        fuel_temp: read_byte(data, &mut offset)?,
-        fuel_temp_correction: read_byte(data, &mut offset)?,
-        ve1: read_byte(data, &mut offset)?,
-        ve2: read_byte(data, &mut offset)?,
-        advance1: read_byte(data, &mut offset)?,
-        advance2: read_byte(data, &mut offset)?,
-        nitrous_status: read_byte(data, &mut offset)?,
-        ts_sd_status: read_byte(data, &mut offset)?,
+    let fmt = if data.len() >= 138 {
+        "real-firmware/138"
+    } else {
+        "sim/130"
+    };
+    debug!(
+        "Parsing {} bytes of ECU realtime data ({})",
+        data.len(),
+        fmt
+    );
+    let ecu_data = parse_realtime_data(data)?;
+
+    if let Some(sender) = mqtt_sender {
+        publish_speeduino_params_to_mqtt(sender, config, &ecu_data).await?;
+    }
+
+    Ok(ecu_data)
+}
+
+// ---------------------------------------------------------------------------
+// Internal parser
+// ---------------------------------------------------------------------------
+
+fn parse_realtime_data(data: &[u8]) -> Result<SpeeduinoData> {
+    // Byte layout matches `getTSLogEntry()` in Speeduino logger.cpp.
+    // Minimum: 130 bytes (speeduino-serial-sim) or 138 bytes (current firmware).
+    // The secondary-serial 'A' response (75 bytes) uses a different, incompatible layout.
+    const MIN_BYTES: usize = 130;
+    if data.len() < MIN_BYTES {
+        return Err(ParseError::InsufficientData {
+            expected: MIN_BYTES,
+            actual: data.len(),
+        }
+        .into());
+    }
+
+    // Inline helpers for little-endian multi-byte reads.
+    let u16_le = |lo: usize, hi: usize| -> u16 { (data[hi] as u16) << 8 | data[lo] as u16 };
+    let i16_le = |lo: usize, hi: usize| -> i16 { u16_le(lo, hi) as i16 };
+
+    // Bytes 42–73: 16 CAN input channels (2 bytes each, little-endian u16)
+    let mut canin = [0u16; 16];
+    for i in 0..16 {
+        canin[i] = u16_le(42 + i * 2, 43 + i * 2);
+    }
+
+    // Optional fields — all present in 130-byte packets.
+    // PW5–PW8 (bytes 130–137) require the full 138-byte current-firmware packet.
+    let emap = if data.len() >= 123 {
+        Some(u16_le(121, 122))
+    } else {
+        None
+    };
+    let fan_duty = if data.len() >= 124 {
+        Some(data[123])
+    } else {
+        None
+    };
+    let air_con_status = if data.len() >= 125 {
+        Some(data[124])
+    } else {
+        None
+    };
+    let actual_dwell = if data.len() >= 127 {
+        Some(u16_le(125, 126))
+    } else {
+        None
+    };
+    let status5 = if data.len() >= 128 {
+        Some(data[127])
+    } else {
+        None
+    };
+    let knock_count = if data.len() >= 129 {
+        Some(data[128])
+    } else {
+        None
+    };
+    let knock_retard = if data.len() >= 130 {
+        Some(data[129])
+    } else {
+        None
+    };
+    let pw5 = if data.len() >= 132 {
+        Some(u16_le(130, 131))
+    } else {
+        None
+    };
+    let pw6 = if data.len() >= 134 {
+        Some(u16_le(132, 133))
+    } else {
+        None
+    };
+    let pw7 = if data.len() >= 136 {
+        Some(u16_le(134, 135))
+    } else {
+        None
+    };
+    let pw8 = if data.len() >= 138 {
+        Some(u16_le(136, 137))
+    } else {
+        None
     };
 
-    // Validate critical parameters
-    validate_data(&speeduino_data)?;
-    
-    Ok(speeduino_data)
+    let parsed = SpeeduinoData {
+        // ---- Bytes 0–3 ----------------------------------------
+        secl: data[0],
+        status1: data[1],
+        engine: data[2],
+        sync_loss_counter: data[3],
+        // ---- Bytes 4–21 ---------------------------------------
+        map: u16_le(4, 5),
+        iat_raw: data[6],
+        coolant_raw: data[7],
+        bat_correction: data[8],
+        battery_10: data[9],
+        o2_primary: data[10],
+        ego_correction: data[11],
+        iat_correction: data[12],
+        wue_correction: data[13],
+        rpm: u16_le(14, 15),
+        tae_amount_raw: data[16],
+        corrections: u16_le(17, 18),
+        ve1: data[19],
+        ve2: data[20],
+        afr_target: data[21],
+        // ---- Bytes 22–41 — NOTE: tpsDOT is u16 (two bytes) ----
+        tps_dot: u16_le(22, 23),
+        advance: data[24],
+        tps: data[25],
+        loops_per_second: u16_le(26, 27),
+        free_ram: u16_le(28, 29),
+        boost_target_raw: data[30],
+        boost_duty_raw: data[31],
+        spark: data[32],
+        rpm_dot: i16_le(33, 34),
+        ethanol_pct: data[35],
+        flex_correction: data[36],
+        flex_ign_correction: data[37],
+        idle_load: data[38],
+        test_outputs: data[39],
+        o2_secondary: data[40],
+        baro: data[41],
+        // ---- Bytes 42–73 (CAN inputs) -------------------------
+        canin,
+        // ---- Bytes 74–91 --------------------------------------
+        tps_adc: data[74],
+        next_error: data[75],
+        pw1: u16_le(76, 77),
+        pw2: u16_le(78, 79),
+        pw3: u16_le(80, 81),
+        pw4: u16_le(82, 83),
+        status3: data[84],
+        engine_protect_status: data[85],
+        fuel_load: u16_le(86, 87),
+        ign_load: u16_le(88, 89),
+        dwell: u16_le(90, 91),
+        // ---- Bytes 92–120 — NOTE: mapDOT is u16 (two bytes) ---
+        cl_idle_target: data[92],
+        map_dot: u16_le(93, 94),
+        vvt1_angle: i16_le(95, 96),
+        vvt1_target_angle: data[97],
+        vvt1_duty: data[98],
+        flex_boost_correction: u16_le(99, 100),
+        baro_correction: data[101],
+        ve_current: data[102],
+        ase_value: data[103],
+        vss: u16_le(104, 105),
+        gear: data[106],
+        fuel_pressure: data[107],
+        oil_pressure: data[108],
+        wmi_pw: data[109],
+        status4: data[110],
+        vvt2_angle: i16_le(111, 112),
+        vvt2_target_angle: data[113],
+        vvt2_duty: data[114],
+        outputs_status: data[115],
+        fuel_temp_raw: data[116],
+        fuel_temp_correction: data[117],
+        advance1: data[118],
+        advance2: data[119],
+        ts_sd_status: data[120],
+        // ---- Optional / extended fields -----------------------
+        emap,
+        fan_duty,
+        air_con_status,
+        actual_dwell,
+        status5,
+        knock_count,
+        knock_retard,
+        pw5,
+        pw6,
+        pw7,
+        pw8,
+    };
+
+    validate_data(&parsed);
+    Ok(parsed)
 }
 
-/// Retrieves the parameters from the provided `SpeeduinoData` structure.
-///
-/// This function extracts various parameters from the `SpeeduinoData` structure
-/// and returns them as a vector of tuples, where each tuple contains a parameter code
-/// and its corresponding value as a string.
-///
-/// # Arguments
-///
-/// * `speeduino_data` - A reference to the `SpeeduinoData` structure containing the parameters.
-///
-/// # Returns
-///
-/// A vector of tuples, where each tuple contains a parameter code as a string slice
-/// and its corresponding value as a string.
-///
-/// # Example
-///
-/// ```rust
-/// let speeduino_data = SpeeduinoData { /* initialize fields */ };
-/// let params = get_params_to_publish(&speeduino_data);
-/// for (code, value) in params {
-///     println!("{}: {}", code, value);
-/// }
-/// ```
-fn get_params_to_publish(speeduino_data: &SpeeduinoData) -> Vec<(&str, String)> {
-    vec![
-        (
-            "RPM",
-            combine_bytes(speeduino_data.rpm_high, speeduino_data.rpm_low).to_string(),
-        ),
-        ("TPS", speeduino_data.tps.to_string()),
-        ("VE1", speeduino_data.ve.to_string()),
-        ("O2P", (speeduino_data.o2_primary as f32 / 10.0).to_string()),
-        ("MAT", speeduino_data.mat.to_string()),
-        ("CAD", speeduino_data.coolant_adc.to_string()),
-        ("DWL", speeduino_data.dwell.to_string()),
-        (
-            "MAP",
-            combine_bytes(speeduino_data.map_high, speeduino_data.map_low).to_string(),
-        ),
-        (
-            "O2S",
-            (speeduino_data.o2_secondary as f32 / 10.0).to_string(),
-        ),
-        ("ITC", speeduino_data.iat_correction.to_string()),
-        ("TAE", speeduino_data.tae_amount.to_string()),
-        ("COR", speeduino_data.corrections.to_string()),
-        ("AFT", (speeduino_data.afr_target as f32 / 10.0).to_string()),
-        (
-            "PW1",
-            combine_bytes(speeduino_data.pw1_high, speeduino_data.pw1_low).to_string(),
-        ),
-        ("TPD", speeduino_data.tps_dot.to_string()),
-        ("ADV", speeduino_data.advance.to_string()),
-        (
-            "LPS",
-            combine_bytes(
-                speeduino_data.loops_per_second_high,
-                speeduino_data.loops_per_second_low,
-            )
-            .to_string(),
-        ),
-        (
-            "FRM",
-            combine_bytes(speeduino_data.free_ram_high, speeduino_data.free_ram_low).to_string(),
-        ),
-        ("BST", speeduino_data.boost_target.to_string()),
-        ("BSD", speeduino_data.boost_duty.to_string()),
-        ("SPK", speeduino_data.spark.to_string()),
-        (
-            "RPD",
-            combine_bytes(speeduino_data.rpm_dot_high, speeduino_data.rpm_dot_low).to_string(),
-        ),
-        ("ETH", speeduino_data.ethanol_pct.to_string()),
-        ("FLC", speeduino_data.flex_correction.to_string()),
-        ("FIC", speeduino_data.flex_ign_correction.to_string()),
-        ("ILL", speeduino_data.idle_load.to_string()),
-        ("TOF", speeduino_data.test_outputs.to_string()),
-        ("BAR", speeduino_data.baro.to_string()),
-        (
-            "CN1",
-            combine_bytes(speeduino_data.canin[1], speeduino_data.canin[0]).to_string(),
-        ),
-        (
-            "CN2",
-            combine_bytes(speeduino_data.canin[3], speeduino_data.canin[2]).to_string(),
-        ),
-        (
-            "CN3",
-            combine_bytes(speeduino_data.canin[5], speeduino_data.canin[4]).to_string(),
-        ),
-        (
-            "CN4",
-            combine_bytes(speeduino_data.canin[7], speeduino_data.canin[6]).to_string(),
-        ),
-        (
-            "CN5",
-            combine_bytes(speeduino_data.canin[9], speeduino_data.canin[8]).to_string(),
-        ),
-        (
-            "CN6",
-            combine_bytes(speeduino_data.canin[11], speeduino_data.canin[10]).to_string(),
-        ),
-        (
-            "CN7",
-            combine_bytes(speeduino_data.canin[13], speeduino_data.canin[12]).to_string(),
-        ),
-        (
-            "CN8",
-            combine_bytes(speeduino_data.canin[15], speeduino_data.canin[14]).to_string(),
-        ),
-        ("TAD", speeduino_data.tps_adc.to_string()),
-        ("NER", speeduino_data.next_error.to_string()),
-        ("STA", speeduino_data.status1.to_string()),
-        ("ENG", speeduino_data.engine.to_string()),
-        ("BTC", speeduino_data.bat_correction.to_string()),
-        ("BAT", (speeduino_data.battery_10 as f32 / 10.0).to_string()),
-        ("EGC", speeduino_data.ego_correction.to_string()),
-        ("WEC", speeduino_data.wue_correction.to_string()),
-        ("SCL", speeduino_data.secl.to_string()),
-        ("LNC", speeduino_data.launch_correction.to_string()),
-        (
-            "PW2",
-            combine_bytes(speeduino_data.pw2_high, speeduino_data.pw2_low).to_string(),
-        ),
-        (
-            "PW3",
-            combine_bytes(speeduino_data.pw3_high, speeduino_data.pw3_low).to_string(),
-        ),
-        (
-            "PW4",
-            combine_bytes(speeduino_data.pw4_high, speeduino_data.pw4_low).to_string(),
-        ),
-        ("ST3", speeduino_data.status3.to_string()),
-        ("EPS", speeduino_data.engine_protect_status.to_string()),
-        (
-            "FLD",
-            combine_bytes(speeduino_data.fuel_load_high, speeduino_data.fuel_load_low).to_string(),
-        ),
-        (
-            "IGD",
-            combine_bytes(speeduino_data.ign_load_high, speeduino_data.ign_load_low).to_string(),
-        ),
-        (
-            "INA",
-            combine_bytes(speeduino_data.inj_angle_high, speeduino_data.inj_angle_low).to_string(),
-        ),
-        ("IDY", speeduino_data.idle_duty.to_string()),
-        ("CLT", speeduino_data.cl_idle_target.to_string()),
-        ("MPD", speeduino_data.map_dot.to_string()),
-        ("VA1", speeduino_data.vvt1_angle.to_string()),
-        ("VT1", speeduino_data.vvt1_target_angle.to_string()),
-        ("VD1", speeduino_data.vvt1_duty.to_string()),
-        (
-            "FBC",
-            combine_bytes(
-                speeduino_data.flex_boost_correction_high,
-                speeduino_data.flex_boost_correction_low,
-            )
-            .to_string(),
-        ),
-        ("BRC", speeduino_data.baro_correction.to_string()),
-        ("ASE", speeduino_data.ase_value.to_string()),
-        (
-            "VSS",
-            combine_bytes(speeduino_data.vss_high, speeduino_data.vss_low).to_string(),
-        ),
-        ("GER", speeduino_data.gear.to_string()),
-        ("FPR", speeduino_data.fuel_pressure.to_string()),
-        ("OPR", speeduino_data.oil_pressure.to_string()),
-        ("WMI", speeduino_data.wmi_pw.to_string()),
-        ("ST4", speeduino_data.status4.to_string()),
-        ("VA2", speeduino_data.vvt2_angle.to_string()),
-        ("VT2", speeduino_data.vvt2_target_angle.to_string()),
-        ("VD2", speeduino_data.vvt2_duty.to_string()),
-        ("OUT", speeduino_data.outputs_status.to_string()),
-        ("FTP", (speeduino_data.fuel_temp as i16 - 40).to_string()), // Apply temperature offset
-        ("FTC", speeduino_data.fuel_temp_correction.to_string()),
-        ("VE1", speeduino_data.ve1.to_string()),
-        ("VE2", speeduino_data.ve2.to_string()),
-        ("AD1", speeduino_data.advance1.to_string()),
-        ("AD2", speeduino_data.advance2.to_string()),
-        ("NOS", speeduino_data.nitrous_status.to_string()),
-        ("SDS", speeduino_data.ts_sd_status.to_string()),
-    ]
+/// Log warnings for out-of-range values.  Never fails parsing.
+fn validate_data(d: &SpeeduinoData) {
+    if d.rpm > RPM_MAX {
+        warn!("RPM out of range: {} (max {})", d.rpm, RPM_MAX);
+    }
+    let coolant_c = d.coolant_celsius();
+    if coolant_c < TEMP_MIN || coolant_c > TEMP_MAX {
+        warn!("Coolant temp out of range: {}°C", coolant_c);
+    }
+    let iat_c = d.iat_celsius();
+    if iat_c < TEMP_MIN || iat_c > TEMP_MAX {
+        warn!("IAT out of range: {}°C", iat_c);
+    }
+    if d.map > MAP_MAX {
+        warn!("MAP out of range: {} kPa (max {})", d.map, MAP_MAX);
+    }
+    if d.tps > TPS_MAX {
+        warn!("TPS out of range: {}% (max {})", d.tps, TPS_MAX);
+    }
+    let batt = d.battery_voltage();
+    if batt > 0.0 && (batt < BATTERY_MIN || batt > BATTERY_MAX) {
+        warn!("Battery voltage out of range: {:.1} V", batt);
+    }
 }
 
-/// Publishes Speeduino parameters to an MQTT broker.
-///
-/// This function retrieves the parameters from the provided `SpeeduinoData`
-/// and publishes each parameter to the MQTT broker using the provided MQTT client.
-///
-/// # Arguments
-///
-/// * `client` - A reference to the MQTT client used to publish the messages.
-/// * `config` - A reference to the application configuration, which contains the base MQTT topic.
-/// * `speeduino_data` - A reference to the `SpeeduinoData` structure containing the parameters to be published.
-///
-/// # Example
-///
-/// ```rust
-/// let client = mqtt::Client::new("mqtt://broker.hivemq.com:1883").unwrap();
-/// let config = Arc::new(AppConfig { mqtt_base_topic: "speeduino/".to_string() });
-/// let speeduino_data = SpeeduinoData { /* initialize fields */ };
-///
-/// publish_speeduino_params_to_mqtt(&client, &config, &speeduino_data);
-/// ```
+// ---------------------------------------------------------------------------
+// MQTT publishing
+// ---------------------------------------------------------------------------
+
+/// Build the full list of (topic-code, value) pairs for publishing.
+/// Every Speeduino 'A' command parameter is present.
+pub fn get_params_to_publish(d: &SpeeduinoData) -> Vec<(&'static str, String)> {
+    let mut params: Vec<(&'static str, String)> = vec![
+        // Engine basics
+        ("RPM", d.rpm.to_string()),
+        ("TPS", d.tps.to_string()),
+        ("MAP", d.map.to_string()),
+        ("BAR", d.baro.to_string()),
+        ("BAT", format!("{:.1}", d.battery_voltage())),
+        ("SCL", d.secl.to_string()),
+        ("SYN", d.sync_loss_counter.to_string()),
+        // Temperatures – raw bytes (backward-compatible names)
+        ("MAT", d.iat_raw.to_string()),
+        ("CAD", d.coolant_raw.to_string()),
+        // Temperatures – converted to °C
+        ("IAT", d.iat_celsius().to_string()),
+        ("CLT", d.coolant_celsius().to_string()),
+        // O2 sensors
+        ("O2P", d.o2_primary.to_string()),
+        ("O2S", d.o2_secondary.to_string()),
+        // Fuel
+        ("AFT", format!("{:.1}", d.afr_target_real())),
+        ("VE1", d.ve1.to_string()),
+        ("VE2", d.ve2.to_string()),
+        ("VEC", d.ve_current.to_string()),
+        ("PW1", format!("{:.1}", d.pw1_ms())),
+        ("PW2", format!("{:.1}", d.pw2_ms())),
+        ("PW3", format!("{:.1}", d.pw3_ms())),
+        ("PW4", format!("{:.1}", d.pw4_ms())),
+        // Ignition
+        ("ADV", d.advance.to_string()),
+        ("AD1", d.advance1.to_string()),
+        ("AD2", d.advance2.to_string()),
+        ("DWL", format!("{:.1}", d.dwell_ms())),
+        ("SPK", d.spark.to_string()),
+        // Corrections
+        ("BTC", d.bat_correction.to_string()),
+        ("EGC", d.ego_correction.to_string()),
+        ("ITC", d.iat_correction.to_string()),
+        ("WEC", d.wue_correction.to_string()),
+        ("COR", d.corrections.to_string()),
+        ("BRC", d.baro_correction.to_string()),
+        ("ASE", d.ase_value.to_string()),
+        ("TAE", d.tae_amount_pct().to_string()),
+        // Boost
+        ("BST", d.boost_target_kpa().to_string()),
+        ("BSD", d.boost_duty_pct().to_string()),
+        // Flex / ethanol
+        ("ETH", d.ethanol_pct.to_string()),
+        ("FLC", d.flex_correction.to_string()),
+        ("FIC", d.flex_ign_correction.to_string()),
+        ("FBC", d.flex_boost_correction.to_string()),
+        // Fuel temperature
+        ("FTP", d.fuel_temp_celsius().to_string()),
+        ("FTC", d.fuel_temp_correction.to_string()),
+        // Performance
+        ("LPS", d.loops_per_second.to_string()),
+        ("FRM", d.free_ram.to_string()),
+        ("RPD", d.rpm_dot.to_string()),
+        // Throttle detail
+        ("TPD", d.tps_dot.to_string()),
+        ("TAD", d.tps_adc.to_string()),
+        // Load
+        ("FLD", d.fuel_load.to_string()),
+        ("IGD", d.ign_load.to_string()),
+        // Idle
+        ("ILL", d.idle_load.to_string()),
+        ("MPD", d.map_dot.to_string()),
+        ("CIT", d.cl_idle_target.to_string()),
+        // VVT
+        ("VA1", d.vvt1_angle.to_string()),
+        ("VT1", d.vvt1_target_angle.to_string()),
+        ("VD1", d.vvt1_duty.to_string()),
+        ("VA2", d.vvt2_angle.to_string()),
+        ("VT2", d.vvt2_target_angle.to_string()),
+        ("VD2", d.vvt2_duty.to_string()),
+        // Vehicle
+        ("VSS", d.vss.to_string()),
+        ("GER", d.gear.to_string()),
+        // Pressures
+        ("FPR", d.fuel_pressure.to_string()),
+        ("OPR", d.oil_pressure.to_string()),
+        // Misc
+        ("WMI", d.wmi_pw.to_string()),
+        ("TOF", d.test_outputs.to_string()),
+        ("NER", d.next_error.to_string()),
+        // Status bitfields
+        ("STA", d.status1.to_string()),
+        ("ENG", d.engine.to_string()),
+        ("ST3", d.status3.to_string()),
+        ("ST4", d.status4.to_string()),
+        ("EPS", d.engine_protect_status.to_string()),
+        ("OUT", d.outputs_status.to_string()),
+        ("SDS", d.ts_sd_status.to_string()),
+        // CAN inputs (CN01–CN16)
+        ("CN01", d.canin[0].to_string()),
+        ("CN02", d.canin[1].to_string()),
+        ("CN03", d.canin[2].to_string()),
+        ("CN04", d.canin[3].to_string()),
+        ("CN05", d.canin[4].to_string()),
+        ("CN06", d.canin[5].to_string()),
+        ("CN07", d.canin[6].to_string()),
+        ("CN08", d.canin[7].to_string()),
+        ("CN09", d.canin[8].to_string()),
+        ("CN10", d.canin[9].to_string()),
+        ("CN11", d.canin[10].to_string()),
+        ("CN12", d.canin[11].to_string()),
+        ("CN13", d.canin[12].to_string()),
+        ("CN14", d.canin[13].to_string()),
+        ("CN15", d.canin[14].to_string()),
+        ("CN16", d.canin[15].to_string()),
+    ];
+
+    // Optional EMAP and extended fields
+    if let Some(v) = d.emap {
+        params.push(("EMP", v.to_string()));
+    }
+    if let Some(v) = d.fan_duty {
+        params.push(("FAN", v.to_string()));
+    }
+    if let Some(v) = d.air_con_status {
+        params.push(("ACS", v.to_string()));
+    }
+    if let Some(v) = d.actual_dwell {
+        params.push(("ADW", format!("{:.1}", v as f32 / 10.0)));
+    }
+    if let Some(v) = d.status5 {
+        params.push(("ST5", v.to_string()));
+    }
+    if let Some(v) = d.knock_count {
+        params.push(("KNC", v.to_string()));
+    }
+    if let Some(v) = d.knock_retard {
+        params.push(("KNR", v.to_string()));
+    }
+    // PW5–PW8 — current firmware only (138-byte packets)
+    if let Some(v) = d.pw5 {
+        params.push(("PW5", format!("{:.1}", v as f32 / 10.0)));
+    }
+    if let Some(v) = d.pw6 {
+        params.push(("PW6", format!("{:.1}", v as f32 / 10.0)));
+    }
+    if let Some(v) = d.pw7 {
+        params.push(("PW7", format!("{:.1}", v as f32 / 10.0)));
+    }
+    if let Some(v) = d.pw8 {
+        params.push(("PW8", format!("{:.1}", v as f32 / 10.0)));
+    }
+
+    params
+}
+
 async fn publish_speeduino_params_to_mqtt(
     mqtt_sender: &mpsc::Sender<MqttMessage>,
     config: &Arc<AppConfig>,
-    speeduino_data: &SpeeduinoData,
+    d: &SpeeduinoData,
 ) -> Result<()> {
-    let params_to_publish = get_params_to_publish(speeduino_data);
-
-    for (param_code, param_value) in params_to_publish {
-        publish_param_to_mqtt(mqtt_sender, config, param_code, param_value).await?;
+    for (code, value) in get_params_to_publish(d) {
+        let topic = build_topic_path(&config.mqtt_base_topic, code);
+        let msg = MqttMessage::new(topic, value, config.mqtt_qos);
+        mqtt_sender
+            .send(msg)
+            .await
+            .map_err(|_| ParseError::InvalidData {
+                offset: 0,
+                message: "Failed to queue MQTT message (channel closed)".to_string(),
+            })?;
     }
-
     Ok(())
 }
 
-/// Helper function to publish a parameter to MQTT with a three-letter code.
-///
-/// This function constructs the MQTT topic using the base topic from the configuration
-/// and the provided parameter code. It then publishes the parameter value to the MQTT broker.
-///
-/// # Arguments
-///
-/// * `client` - A reference to the MQTT client used to publish the message.
-/// * `config` - A reference to the application configuration, which contains the base MQTT topic.
-/// * `param_code` - A string slice representing the three-letter code of the parameter.
-/// * `param_value` - A string containing the value of the parameter to be published.
-///
-/// # Example
-///
-/// ```rust
-/// let client = mqtt::Client::new("mqtt://broker.hivemq.com:1883").unwrap();
-/// let config = Arc::new(AppConfig { mqtt_base_topic: "speeduino/".to_string() });
-/// let param_code = "RPM";
-/// let param_value = "3000".to_string();
-///
-/// publish_param_to_mqtt(&client, &config, param_code, param_value);
-/// ```
-async fn publish_param_to_mqtt(
-    mqtt_sender: &mpsc::Sender<MqttMessage>,
-    config: &Arc<AppConfig>,
-    param_code: &str,
-    param_value: String,
-) -> Result<()> {
-    let topic = build_topic_path(&config.mqtt_base_topic, param_code);
-    
-    let message = MqttMessage::new(topic, param_value, config.mqtt_qos);
-    
-    mqtt_sender
-        .send(message)
-        .await
-        .map_err(|_| ParseError::InvalidData {
-            offset: 0,
-            message: "Failed to queue MQTT message".to_string(),
-        })?;
-
-    Ok(())
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn zero_packet() -> [u8; 130] {
+        [0u8; 130]
+    }
+
+    // --- Length guards ---
+
     #[test]
-    fn test_parse_realtime_data_valid() {
-        let data: [u8; 120] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
-            0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
-            0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A,
-            0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
-            0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
-            0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52, 0x53, 0x54,
-            0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F, 0x60, 0x61, 0x62,
-            0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70,
-            0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
-        ];
-
-        let result = parse_realtime_data(&data).expect("Should parse successfully");
-
-        // Assert that first fields are correctly parsed
-        assert_eq!(result.secl, 0x01);
-        assert_eq!(result.status1, 0x02);
-        assert_eq!(result.engine, 0x03);
-        assert_eq!(result.dwell, 0x04);
-        assert_eq!(result.map_low, 0x05);
-        assert_eq!(result.map_high, 0x06);
+    fn test_parse_too_short() {
+        assert!(parse_realtime_data(&[0u8; 50]).is_err());
     }
 
     #[test]
-    fn test_parse_realtime_data_insufficient() {
-        let data: [u8; 50] = [0; 50];
-        let result = parse_realtime_data(&data);
-        assert!(result.is_err());
+    fn test_parse_empty() {
+        assert!(parse_realtime_data(&[]).is_err());
     }
 
     #[test]
-    fn test_parse_realtime_data_empty() {
-        let data: [u8; 0] = [];
-        let result = parse_realtime_data(&data);
-        assert!(result.is_err());
+    fn test_parse_129_bytes_too_short() {
+        assert!(parse_realtime_data(&[0u8; 129]).is_err());
     }
 
     #[test]
-    fn test_combine_bytes() {
-        assert_eq!(combine_bytes(0x12, 0x34), 0x1234);
-        assert_eq!(combine_bytes(0xFF, 0xFF), 0xFFFF);
-        assert_eq!(combine_bytes(0x00, 0x00), 0x0000);
-        assert_eq!(combine_bytes(0xAB, 0xCD), 0xABCD);
+    fn test_parse_minimum_130_bytes() {
+        assert!(parse_realtime_data(&[0u8; 130]).is_ok());
     }
 
     #[test]
-    fn test_validate_data_normal_values() {
-        let mut data = create_test_data();
-        // Set normal values
-        data.rpm_high = 0x0B;  // RPM = 3000
-        data.rpm_low = 0xB8;
-        data.coolant_adc = 100; // 60°C
-        data.mat = 80;          // 40°C
-        data.tps = 50;          // 50%
-        data.battery_10 = 140;  // 14.0V
-        
-        let result = validate_data(&data);
-        assert!(result.is_ok());
+    fn test_parse_130_bytes_has_emap() {
+        // All 130-byte packets include EMAP (130 >= 123)
+        let d = parse_realtime_data(&[0u8; 130]).unwrap();
+        assert_eq!(d.emap, Some(0));
     }
 
     #[test]
-    fn test_validate_data_rpm_too_high() {
-        let mut data = create_test_data();
-        data.rpm_high = 0xFF;  // Very high RPM
-        data.rpm_low = 0xFF;
-        
-        // Should still succeed but log a warning
-        let result = validate_data(&data);
-        assert!(result.is_ok());
+    fn test_parse_130_bytes_has_extended_fields() {
+        let d = parse_realtime_data(&[0u8; 130]).unwrap();
+        assert!(d.knock_retard.is_some()); // byte 129 present
     }
 
     #[test]
-    fn test_validate_data_temp_out_of_range() {
-        let mut data = create_test_data();
-        data.coolant_adc = 255; // 215°C (out of range)
-        
-        // Should still succeed but log a warning
-        let result = validate_data(&data);
-        assert!(result.is_ok());
+    fn test_parse_137_bytes_has_pw5_no_pw8() {
+        let d = parse_realtime_data(&[0u8; 137]).unwrap();
+        assert!(d.pw5.is_some()); // 137 >= 132
+        assert!(d.pw8.is_none()); // 137 < 138
     }
 
     #[test]
-    fn test_validate_data_battery_low() {
-        let mut data = create_test_data();
-        data.battery_10 = 70; // 7.0V (too low)
-        
-        // Should still succeed but log a warning
-        let result = validate_data(&data);
-        assert!(result.is_ok());
+    fn test_parse_138_bytes_all_pw_fields() {
+        let d = parse_realtime_data(&[0u8; 138]).unwrap();
+        assert!(d.pw5.is_some());
+        assert!(d.pw8.is_some());
+    }
+
+    // --- Exact byte mapping ---
+
+    #[test]
+    fn test_secl_byte_0() {
+        let mut p = zero_packet();
+        p[0] = 42;
+        assert_eq!(parse_realtime_data(&p).unwrap().secl, 42);
     }
 
     #[test]
-    fn test_validate_data_battery_zero_allowed() {
-        let mut data = create_test_data();
-        data.battery_10 = 0; // 0.0V (disconnected battery - should be allowed)
-        
-        // Should succeed without warning
-        let result = validate_data(&data);
-        assert!(result.is_ok());
+    fn test_sync_loss_counter_byte_3() {
+        let mut p = zero_packet();
+        p[3] = 7;
+        assert_eq!(parse_realtime_data(&p).unwrap().sync_loss_counter, 7);
     }
 
     #[test]
-    fn test_validate_data_tps_over_100() {
-        let mut data = create_test_data();
-        data.tps = 150; // > 100%
-        
-        // Should still succeed but log a warning
-        let result = validate_data(&data);
-        assert!(result.is_ok());
+    fn test_map_le_bytes_4_5() {
+        let mut p = zero_packet();
+        p[4] = 0x2C;
+        p[5] = 0x01; // 300 kPa
+        assert_eq!(parse_realtime_data(&p).unwrap().map, 300);
     }
 
     #[test]
-    fn test_get_params_to_publish_count() {
-        let data = create_test_data();
-        let params = get_params_to_publish(&data);
-        
-        // Should have all 81 parameters (originally 73, expanded with new fields)
-        assert_eq!(params.len(), 81);
+    fn test_rpm_le_bytes_14_15() {
+        let mut p = zero_packet();
+        p[14] = 0xB8;
+        p[15] = 0x0B; // 3000 RPM
+        assert_eq!(parse_realtime_data(&p).unwrap().rpm, 3000);
     }
 
     #[test]
-    fn test_get_params_to_publish_rpm() {
-        let mut data = create_test_data();
-        data.rpm_high = 0x0B;
-        data.rpm_low = 0xB8;
-        
-        let params = get_params_to_publish(&data);
-        let rpm_param = params.iter().find(|(code, _)| *code == "RPM");
-        
-        assert!(rpm_param.is_some());
-        assert_eq!(rpm_param.unwrap().1, "3000");
+    fn test_corrections_two_bytes_17_18() {
+        let mut p = zero_packet();
+        p[17] = 0xE8;
+        p[18] = 0x03; // 1000
+        assert_eq!(parse_realtime_data(&p).unwrap().corrections, 1000);
     }
 
     #[test]
-    fn test_get_params_to_publish_tps() {
-        let mut data = create_test_data();
-        data.tps = 75;
-        
-        let params = get_params_to_publish(&data);
-        let tps_param = params.iter().find(|(code, _)| *code == "TPS");
-        
-        assert!(tps_param.is_some());
-        assert_eq!(tps_param.unwrap().1, "75");
+    fn test_ve1_byte_19_ve2_byte_20() {
+        let mut p = zero_packet();
+        p[19] = 85;
+        p[20] = 90;
+        let d = parse_realtime_data(&p).unwrap();
+        assert_eq!(d.ve1, 85);
+        assert_eq!(d.ve2, 90);
     }
 
     #[test]
-    fn test_get_params_to_publish_battery() {
-        let mut data = create_test_data();
-        data.battery_10 = 140; // 14.0V
-        
-        let params = get_params_to_publish(&data);
-        let bat_param = params.iter().find(|(code, _)| *code == "BAT");
-        
-        assert!(bat_param.is_some());
-        assert_eq!(bat_param.unwrap().1, "14");
+    fn test_afr_target_byte_21() {
+        let mut p = zero_packet();
+        p[21] = 147;
+        let d = parse_realtime_data(&p).unwrap();
+        assert!((d.afr_target_real() - 14.7).abs() < 0.01);
     }
 
-    /// Helper function to create test data with default values
-    fn create_test_data() -> SpeeduinoData {
-        SpeeduinoData {
-            secl: 0,
-            status1: 0,
-            engine: 0,
-            dwell: 0,
-            map_low: 0,
-            map_high: 0,
-            mat: 80,
-            coolant_adc: 100,
-            bat_correction: 100,
-            battery_10: 140,
-            o2_primary: 0,
-            ego_correction: 100,
-            iat_correction: 100,
-            wue_correction: 100,
-            rpm_low: 0,
-            rpm_high: 0,
-            tae_amount: 0,
-            corrections: 100,
-            ve: 100,
-            afr_target: 147,
-            pw1_low: 0,
-            pw1_high: 0,
-            tps_dot: 0,
-            advance: 0,
-            tps: 0,
-            loops_per_second_low: 0,
-            loops_per_second_high: 0,
-            free_ram_low: 0,
-            free_ram_high: 0,
-            boost_target: 0,
-            boost_duty: 0,
-            spark: 0,
-            rpm_dot_low: 0,
-            rpm_dot_high: 0,
-            ethanol_pct: 0,
-            flex_correction: 0,
-            flex_ign_correction: 0,
-            idle_load: 0,
-            test_outputs: 0,
-            o2_secondary: 0,
-            baro: 100,
-            canin: [0; 16],
-            tps_adc: 0,
-            next_error: 0,
-            launch_correction: 0,
-            pw2_low: 0,
-            pw2_high: 0,
-            pw3_low: 0,
-            pw3_high: 0,
-            pw4_low: 0,
-            pw4_high: 0,
-            status3: 0,
-            engine_protect_status: 0,
-            fuel_load_low: 0,
-            fuel_load_high: 0,
-            ign_load_low: 0,
-            ign_load_high: 0,
-            inj_angle_low: 0,
-            inj_angle_high: 0,
-            idle_duty: 0,
-            cl_idle_target: 0,
-            map_dot: 0,
-            vvt1_angle: 0,
-            vvt1_target_angle: 0,
-            vvt1_duty: 0,
-            flex_boost_correction_low: 0,
-            flex_boost_correction_high: 0,
-            baro_correction: 100,
-            ase_value: 0,
-            vss_low: 0,
-            vss_high: 0,
-            gear: 0,
-            fuel_pressure: 200,
-            oil_pressure: 150,
-            wmi_pw: 0,
-            status4: 0,
-            vvt2_angle: 0,
-            vvt2_target_angle: 0,
-            vvt2_duty: 0,
-            outputs_status: 0,
-            fuel_temp: 60,
-            fuel_temp_correction: 100,
-            ve1: 100,
-            ve2: 100,
-            advance1: 0,
-            advance2: 0,
-            nitrous_status: 0,
-            ts_sd_status: 0,
+    #[test]
+    fn test_tps_dot_u16_bytes_22_23() {
+        let mut p = zero_packet();
+        p[22] = 0xC8;
+        p[23] = 0x00; // 200
+        assert_eq!(parse_realtime_data(&p).unwrap().tps_dot, 200);
+    }
+
+    #[test]
+    fn test_advance_byte_24() {
+        let mut p = zero_packet();
+        p[24] = 30;
+        assert_eq!(parse_realtime_data(&p).unwrap().advance, 30);
+    }
+
+    #[test]
+    fn test_tps_byte_25() {
+        let mut p = zero_packet();
+        p[25] = 75;
+        assert_eq!(parse_realtime_data(&p).unwrap().tps, 75);
+    }
+
+    #[test]
+    fn test_pw1_bytes_76_77() {
+        let mut p = zero_packet();
+        p[76] = 35;
+        p[77] = 0; // 3.5 ms
+        let d = parse_realtime_data(&p).unwrap();
+        assert_eq!(d.pw1, 35);
+        assert!((d.pw1_ms() - 3.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_dwell_bytes_90_91() {
+        let mut p = zero_packet();
+        p[90] = 45;
+        p[91] = 0; // 4.5 ms
+        let d = parse_realtime_data(&p).unwrap();
+        assert_eq!(d.dwell, 45);
+        assert!((d.dwell_ms() - 4.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_map_dot_u16_bytes_93_94() {
+        let mut p = zero_packet();
+        p[93] = 0x64;
+        p[94] = 0x00; // 100
+        assert_eq!(parse_realtime_data(&p).unwrap().map_dot, 100);
+    }
+
+    #[test]
+    fn test_ve_current_byte_102() {
+        let mut p = zero_packet();
+        p[102] = 88;
+        assert_eq!(parse_realtime_data(&p).unwrap().ve_current, 88);
+    }
+
+    #[test]
+    fn test_ts_sd_status_byte_120() {
+        let mut p = zero_packet();
+        p[120] = 3;
+        assert_eq!(parse_realtime_data(&p).unwrap().ts_sd_status, 3);
+    }
+
+    // --- CAN inputs ---
+
+    #[test]
+    fn test_canin_ch0_bytes_42_43() {
+        let mut p = zero_packet();
+        p[42] = 0x00;
+        p[43] = 0x02; // 512
+        assert_eq!(parse_realtime_data(&p).unwrap().canin[0], 512);
+    }
+
+    #[test]
+    fn test_canin_ch15_bytes_72_73() {
+        let mut p = zero_packet();
+        p[72] = 0xFF;
+        p[73] = 0x00; // 255
+        assert_eq!(parse_realtime_data(&p).unwrap().canin[15], 255);
+    }
+
+    // --- Temperature offset ---
+
+    #[test]
+    fn test_iat_celsius() {
+        let mut p = zero_packet();
+        p[6] = 80; // 80 - 40 = 40°C
+        assert_eq!(parse_realtime_data(&p).unwrap().iat_celsius(), 40);
+    }
+
+    #[test]
+    fn test_coolant_celsius() {
+        let mut p = zero_packet();
+        p[7] = 125; // 85°C
+        assert_eq!(parse_realtime_data(&p).unwrap().coolant_celsius(), 85);
+    }
+
+    #[test]
+    fn test_zero_raw_temp_is_minus_40c() {
+        let p = zero_packet();
+        let d = parse_realtime_data(&p).unwrap();
+        assert_eq!(d.iat_celsius(), -40);
+        assert_eq!(d.coolant_celsius(), -40);
+    }
+
+    // --- Scaling helpers ---
+
+    #[test]
+    fn test_boost_target_times_2() {
+        let mut p = zero_packet();
+        p[30] = 100;
+        assert_eq!(parse_realtime_data(&p).unwrap().boost_target_kpa(), 200);
+    }
+
+    #[test]
+    fn test_tae_amount_times_2() {
+        let mut p = zero_packet();
+        p[16] = 25;
+        assert_eq!(parse_realtime_data(&p).unwrap().tae_amount_pct(), 50);
+    }
+
+    #[test]
+    fn test_battery_voltage_div_10() {
+        let mut p = zero_packet();
+        p[9] = 142; // 14.2 V
+        assert!((parse_realtime_data(&p).unwrap().battery_voltage() - 14.2).abs() < 0.01);
+    }
+
+    // --- Validation (warnings only, should not fail) ---
+
+    #[test]
+    fn test_validation_does_not_fail_on_overflow() {
+        let mut p = zero_packet();
+        p[14] = 0xFF;
+        p[15] = 0xFF; // RPM = 65535
+        assert!(parse_realtime_data(&p).is_ok());
+    }
+
+    // --- params list ---
+
+    #[test]
+    fn test_params_min_count() {
+        let d = SpeeduinoData::default();
+        let params = get_params_to_publish(&d);
+        assert!(
+            params.len() >= 80,
+            "expected ≥80 params, got {}",
+            params.len()
+        );
+    }
+
+    #[test]
+    fn test_params_rpm() {
+        let mut d = SpeeduinoData::default();
+        d.rpm = 3000;
+        let params = get_params_to_publish(&d);
+        let found = params.iter().find(|(k, _)| *k == "RPM").unwrap();
+        assert_eq!(found.1, "3000");
+    }
+
+    #[test]
+    fn test_params_battery_format() {
+        let mut d = SpeeduinoData::default();
+        d.battery_10 = 142;
+        let params = get_params_to_publish(&d);
+        let found = params.iter().find(|(k, _)| *k == "BAT").unwrap();
+        assert_eq!(found.1, "14.2");
+    }
+
+    #[test]
+    fn test_params_emap_present_when_some() {
+        let mut d = SpeeduinoData::default();
+        d.emap = Some(101);
+        let params = get_params_to_publish(&d);
+        let found = params.iter().find(|(k, _)| *k == "EMP");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().1, "101");
+    }
+
+    #[test]
+    fn test_params_emap_absent_when_none() {
+        let d = SpeeduinoData::default();
+        let params = get_params_to_publish(&d);
+        assert!(!params.iter().any(|(k, _)| *k == "EMP"));
+    }
+
+    #[test]
+    fn test_params_all_16_can_channels() {
+        let mut d = SpeeduinoData::default();
+        for i in 0..16 {
+            d.canin[i] = i as u16 * 100;
+        }
+        let params = get_params_to_publish(&d);
+        for i in 1..=16usize {
+            let code = format!("CN{:02}", i);
+            let found = params.iter().any(|(k, _)| *k == code.as_str());
+            assert!(found, "missing param {}", code);
         }
     }
-}
 
+    #[test]
+    fn test_get_parsed_data_too_short() {
+        assert!(get_parsed_data(&[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn test_get_parsed_data_valid() {
+        assert!(get_parsed_data(&[0u8; 130]).is_ok());
+    }
+}

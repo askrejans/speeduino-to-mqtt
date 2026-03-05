@@ -24,6 +24,7 @@ pub enum AppError {
     Io(#[from] std::io::Error),
 
     #[error("Other error: {0}")]
+    #[allow(dead_code)]
     Other(String),
 }
 
@@ -40,13 +41,15 @@ pub enum ConfigError {
     InvalidValue { field: String, message: String },
 
     #[error("Validation failed: {0}")]
+    #[allow(dead_code)]
     ValidationFailed(String),
 
     #[error("Configuration file not found at any expected location")]
+    #[allow(dead_code)]
     NotFound,
 }
 
-/// Serial port communication errors
+/// Serial port / TCP connection errors
 #[derive(Error, Debug)]
 pub enum SerialError {
     #[error("Failed to open serial port '{port}': {source}")]
@@ -55,7 +58,14 @@ pub enum SerialError {
         source: tokio_serial::Error,
     },
 
+    #[error("Failed to connect to TCP endpoint '{addr}': {source}")]
+    TcpConnectFailed {
+        addr: String,
+        source: std::io::Error,
+    },
+
     #[error("Failed to configure serial port: {0}")]
+    #[allow(dead_code)]
     ConfigFailed(tokio_serial::Error),
 
     #[error("Read timeout after {timeout_ms}ms")]
@@ -71,6 +81,7 @@ pub enum SerialError {
     Disconnected,
 
     #[error("Invalid response: expected {expected} bytes, got {actual}")]
+    #[allow(dead_code)]
     InvalidResponse { expected: usize, actual: usize },
 
     #[error("Maximum reconnection attempts ({0}) exceeded")]
@@ -96,6 +107,7 @@ pub enum MqttError {
     },
 
     #[error("Failed to disconnect: {0}")]
+    #[allow(dead_code)]
     DisconnectFailed(paho_mqtt::Error),
 
     #[error("Connection lost: {0}")]
@@ -105,9 +117,11 @@ pub enum MqttError {
     TlsError(String),
 
     #[error("Authentication failed")]
+    #[allow(dead_code)]
     AuthenticationFailed,
 
     #[error("Message buffer full, dropping message")]
+    #[allow(dead_code)]
     BufferFull,
 }
 
@@ -121,9 +135,11 @@ pub enum ParseError {
     InvalidData { offset: usize, message: String },
 
     #[error("Checksum mismatch: expected {expected:x}, got {actual:x}")]
+    #[allow(dead_code)]
     ChecksumMismatch { expected: u8, actual: u8 },
 
     #[error("Data validation failed for '{field}': value {value} is out of range [{min}, {max}]")]
+    #[allow(dead_code)]
     ValidationFailed {
         field: String,
         value: f64,
@@ -142,10 +158,7 @@ mod tests {
     #[test]
     fn test_error_display() {
         let err = ConfigError::MissingField("port_name".to_string());
-        assert_eq!(
-            err.to_string(),
-            "Missing required field: port_name"
-        );
+        assert_eq!(err.to_string(), "Missing required field: port_name");
 
         let err = ParseError::ValidationFailed {
             field: "RPM".to_string(),

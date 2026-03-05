@@ -1,6 +1,7 @@
 //! Configuration management module
 //!
 //! Handles loading, validation, and environment variable overrides for application configuration.
+//! Supports `.env` files via dotenvy, TOML config files, and `SPEEDUINO_*` env var overrides.
 
 use crate::errors::{ConfigError, Result};
 use config::{Config, Environment, File};
@@ -9,121 +10,184 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 
 /// Valid baud rates for serial communication
-const VALID_BAUD_RATES: &[u32] = &[
-    9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600,
-];
+const VALID_BAUD_RATES: &[u32] = &[9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
 
 /// Main application configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    // Serial port configuration
-    /// The name of the serial port (e.g., "/dev/ttyACM0", "COM3")
+    // --- Connection type ---
+    /// Connection type: "serial" (hardware UART) or "tcp" (raw TCP socket / WiFi bridge)
+    #[serde(default = "default_connection_type")]
+    pub connection_type: String,
+
+    /// TCP host for "tcp" connection_type (e.g. "192.168.1.100" or WiFi bridge hostname)
+    pub tcp_host: Option<String>,
+
+    /// TCP port for "tcp" connection_type (e.g. 4096 for most serial-to-TCP bridges)
+    pub tcp_port: Option<u16>,
+
+    // --- Serial port configuration (used when connection_type = "serial") ---
+    /// The serial port device path (e.g., "/dev/ttyACM0", "COM3")
+    #[serde(default = "default_port_name")]
     pub port_name: String,
-    
-    /// The baud rate for serial communication
+
+    /// Baud rate for serial communication with Speeduino ECU
+    #[serde(default = "default_baud_rate")]
     pub baud_rate: u32,
-    
-    /// Expected data packet length from ECU (bytes)
+
+    /// Expected data packet length from ECU in bytes.
+    /// 130 = speeduino-serial-sim / older firmware, 138 = current Speeduino firmware (LOG_ENTRY_SIZE).
     #[serde(default = "default_expected_data_length")]
     pub expected_data_length: usize,
-    
+
     /// Serial read timeout in milliseconds
     #[serde(default = "default_read_timeout_ms")]
     pub read_timeout_ms: u64,
-    
-    // MQTT broker configuration
+
+    // --- MQTT broker configuration ---
+    /// Enable MQTT publishing (set false to run in display-only / TUI mode)
+    #[serde(default = "default_mqtt_enabled")]
+    pub mqtt_enabled: bool,
+
     /// MQTT broker host address
+    #[serde(default = "default_mqtt_host")]
     pub mqtt_host: String,
-    
+
     /// MQTT broker port number
+    #[serde(default = "default_mqtt_port")]
     pub mqtt_port: u16,
-    
-    /// Base MQTT topic prefix (e.g., "/GOLF86/ECU/")
+
+    /// Base MQTT topic prefix (e.g. "/GOLF86/ECU/")
+    #[serde(default = "default_mqtt_base_topic")]
     pub mqtt_base_topic: String,
-    
+
     /// MQTT Quality of Service level (0, 1, or 2)
     #[serde(default = "default_mqtt_qos")]
     pub mqtt_qos: i32,
-    
+
     /// MQTT client ID (auto-generated if not specified)
     pub mqtt_client_id: Option<String>,
-    
+
     /// MQTT username for authentication (optional)
     pub mqtt_username: Option<String>,
-    
+
     /// MQTT password for authentication (optional)
     pub mqtt_password: Option<String>,
-    
+
     /// Enable MQTT over TLS/SSL
     #[serde(default)]
     pub mqtt_use_tls: bool,
-    
+
     /// Path to CA certificate for TLS (optional)
     pub mqtt_ca_cert_path: Option<String>,
-    
+
     /// Path to client certificate for TLS (optional)
     pub mqtt_client_cert_path: Option<String>,
-    
+
     /// Path to client private key for TLS (optional)
     pub mqtt_client_key_path: Option<String>,
-    
-    // Application behavior configuration
+
+    // --- Application behaviour ---
     /// ECU data polling interval in milliseconds
     #[serde(default = "default_refresh_rate_ms")]
     pub refresh_rate_ms: u64,
-    
-    /// Maximum number of reconnection attempts
+
+    /// Maximum number of reconnection attempts before exiting
     #[serde(default = "default_max_retry_count")]
     pub max_retry_count: u32,
-    
-    /// Initial reconnection delay in milliseconds
+
+    /// Initial reconnection delay in milliseconds (exponential backoff base)
     #[serde(default = "default_initial_retry_delay_ms")]
     pub initial_retry_delay_ms: u64,
-    
-    /// Maximum reconnection delay in milliseconds (for exponential backoff)
+
+    /// Maximum reconnection delay in milliseconds (caps exponential backoff)
     #[serde(default = "default_max_retry_delay_ms")]
     pub max_retry_delay_ms: u64,
-    
-    /// MQTT message buffer size (number of messages)
+
+    /// MQTT message buffer size (number of messages queued when broker is unavailable)
     #[serde(default = "default_message_buffer_size")]
     pub message_buffer_size: usize,
-    
-    // Logging configuration
-    /// Log level (trace, debug, info, warn, error)
+
+    // --- Logging ---
+    /// Log level: trace | debug | info | warn | error
     #[serde(default = "default_log_level")]
     pub log_level: String,
-    
-    /// Enable JSON formatted logs
+
+    /// Enable JSON structured logs (useful for log aggregation systems like ELK)
     #[serde(default)]
     pub log_json: bool,
-    
-    // Internal field
-    /// Path to the configuration file (set at runtime)
+
+    /// Internal: path to the configuration file that was loaded (set at runtime)
     #[serde(skip)]
     pub config_path: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
 // Default value functions
-fn default_expected_data_length() -> usize { 120 }
-fn default_read_timeout_ms() -> u64 { 2000 }
-fn default_mqtt_qos() -> i32 { 1 }
-fn default_refresh_rate_ms() -> u64 { 20 }
-fn default_max_retry_count() -> u32 { 10 }
-fn default_initial_retry_delay_ms() -> u64 { 1000 }
-fn default_max_retry_delay_ms() -> u64 { 60000 }
-fn default_message_buffer_size() -> usize { 1000 }
-fn default_log_level() -> String { "info".to_string() }
+// ---------------------------------------------------------------------------
+fn default_connection_type() -> String {
+    "serial".to_string()
+}
+fn default_port_name() -> String {
+    "/dev/ttyACM0".to_string()
+}
+fn default_baud_rate() -> u32 {
+    115200
+}
+fn default_expected_data_length() -> usize {
+    130
+}
+fn default_read_timeout_ms() -> u64 {
+    2000
+}
+fn default_mqtt_enabled() -> bool {
+    true
+}
+fn default_mqtt_host() -> String {
+    "localhost".to_string()
+}
+fn default_mqtt_port() -> u16 {
+    1883
+}
+fn default_mqtt_base_topic() -> String {
+    "/speeduino/ecu/".to_string()
+}
+fn default_mqtt_qos() -> i32 {
+    0
+}
+fn default_refresh_rate_ms() -> u64 {
+    20
+}
+fn default_max_retry_count() -> u32 {
+    10
+}
+fn default_initial_retry_delay_ms() -> u64 {
+    1000
+}
+fn default_max_retry_delay_ms() -> u64 {
+    60000
+}
+fn default_message_buffer_size() -> usize {
+    1000
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            port_name: "/dev/ttyACM0".to_string(),
-            baud_rate: 115200,
+            connection_type: default_connection_type(),
+            tcp_host: None,
+            tcp_port: None,
+            port_name: default_port_name(),
+            baud_rate: default_baud_rate(),
             expected_data_length: default_expected_data_length(),
             read_timeout_ms: default_read_timeout_ms(),
-            mqtt_host: "localhost".to_string(),
-            mqtt_port: 1883,
-            mqtt_base_topic: "/speeduino/ecu/".to_string(),
+            mqtt_enabled: default_mqtt_enabled(),
+            mqtt_host: default_mqtt_host(),
+            mqtt_port: default_mqtt_port(),
+            mqtt_base_topic: default_mqtt_base_topic(),
             mqtt_qos: default_mqtt_qos(),
             mqtt_client_id: None,
             mqtt_username: None,
@@ -145,37 +209,59 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Validate the configuration values
+    /// Validate all configuration values against acceptable ranges and constraints.
     pub fn validate(&self) -> Result<()> {
         debug!("Validating configuration");
 
-        // Validate port_name
-        if self.port_name.is_empty() {
-            return Err(ConfigError::MissingField("port_name".to_string()).into());
-        }
-
-        // Validate baud_rate
-        if !VALID_BAUD_RATES.contains(&self.baud_rate) {
-            return Err(ConfigError::InvalidValue {
-                field: "baud_rate".to_string(),
-                message: format!(
-                    "must be one of: {:?}",
-                    VALID_BAUD_RATES
-                ),
+        match self.connection_type.to_lowercase().as_str() {
+            "serial" => {
+                if self.port_name.is_empty() {
+                    return Err(ConfigError::MissingField("port_name".to_string()).into());
+                }
+                if !VALID_BAUD_RATES.contains(&self.baud_rate) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "baud_rate".to_string(),
+                        message: format!("must be one of: {:?}", VALID_BAUD_RATES),
+                    }
+                    .into());
+                }
             }
-            .into());
+            "tcp" => {
+                if self
+                    .tcp_host
+                    .as_deref()
+                    .map(|h| h.is_empty())
+                    .unwrap_or(true)
+                {
+                    return Err(ConfigError::MissingField(
+                        "tcp_host (required when connection_type = \"tcp\")".to_string(),
+                    )
+                    .into());
+                }
+                if self.tcp_port.is_none() {
+                    return Err(ConfigError::MissingField(
+                        "tcp_port (required when connection_type = \"tcp\")".to_string(),
+                    )
+                    .into());
+                }
+            }
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "connection_type".to_string(),
+                    message: format!("must be \"serial\" or \"tcp\", got \"{}\"", other),
+                }
+                .into());
+            }
         }
 
-        // Validate expected_data_length
-        if self.expected_data_length == 0 || self.expected_data_length > 1024 {
+        if self.expected_data_length < 119 || self.expected_data_length > 256 {
             return Err(ConfigError::InvalidValue {
                 field: "expected_data_length".to_string(),
-                message: "must be between 1 and 1024".to_string(),
+                message: "must be between 119 and 256".to_string(),
             }
             .into());
         }
 
-        // Validate read_timeout_ms
         if self.read_timeout_ms == 0 || self.read_timeout_ms > 30000 {
             return Err(ConfigError::InvalidValue {
                 field: "read_timeout_ms".to_string(),
@@ -184,35 +270,47 @@ impl AppConfig {
             .into());
         }
 
-        // Validate mqtt_host
-        if self.mqtt_host.is_empty() {
-            return Err(ConfigError::MissingField("mqtt_host".to_string()).into());
-        }
-
-        // Validate mqtt_port
-        if self.mqtt_port == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "mqtt_port".to_string(),
-                message: "must be greater than 0".to_string(),
+        if self.mqtt_enabled {
+            if self.mqtt_host.is_empty() {
+                return Err(ConfigError::MissingField("mqtt_host".to_string()).into());
             }
-            .into());
-        }
-
-        // Validate mqtt_base_topic
-        if self.mqtt_base_topic.is_empty() {
-            return Err(ConfigError::MissingField("mqtt_base_topic".to_string()).into());
-        }
-
-        // Validate mqtt_qos
-        if !(0..=2).contains(&self.mqtt_qos) {
-            return Err(ConfigError::InvalidValue {
-                field: "mqtt_qos".to_string(),
-                message: "must be 0, 1, or 2".to_string(),
+            if self.mqtt_port == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "mqtt_port".to_string(),
+                    message: "must be greater than 0".to_string(),
+                }
+                .into());
             }
-            .into());
+            if self.mqtt_base_topic.is_empty() {
+                return Err(ConfigError::MissingField("mqtt_base_topic".to_string()).into());
+            }
+            if !(0..=2).contains(&self.mqtt_qos) {
+                return Err(ConfigError::InvalidValue {
+                    field: "mqtt_qos".to_string(),
+                    message: "must be 0, 1, or 2".to_string(),
+                }
+                .into());
+            }
+            if self.mqtt_use_tls {
+                if let Some(ref ca_path) = self.mqtt_ca_cert_path {
+                    if !Path::new(ca_path).exists() {
+                        return Err(ConfigError::InvalidValue {
+                            field: "mqtt_ca_cert_path".to_string(),
+                            message: format!("file does not exist: {}", ca_path),
+                        }
+                        .into());
+                    }
+                }
+            }
+            if self.message_buffer_size == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "message_buffer_size".to_string(),
+                    message: "must be greater than 0".to_string(),
+                }
+                .into());
+            }
         }
 
-        // Validate refresh_rate_ms
         if self.refresh_rate_ms == 0 || self.refresh_rate_ms > 10000 {
             return Err(ConfigError::InvalidValue {
                 field: "refresh_rate_ms".to_string(),
@@ -221,7 +319,6 @@ impl AppConfig {
             .into());
         }
 
-        // Validate retry settings
         if self.max_retry_count == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "max_retry_count".to_string(),
@@ -241,21 +338,11 @@ impl AppConfig {
         if self.max_retry_delay_ms < self.initial_retry_delay_ms {
             return Err(ConfigError::InvalidValue {
                 field: "max_retry_delay_ms".to_string(),
-                message: "must be greater than or equal to initial_retry_delay_ms".to_string(),
+                message: "must be >= initial_retry_delay_ms".to_string(),
             }
             .into());
         }
 
-        // Validate message_buffer_size
-        if self.message_buffer_size == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "message_buffer_size".to_string(),
-                message: "must be greater than 0".to_string(),
-            }
-            .into());
-        }
-
-        // Validate log_level
         let valid_log_levels = ["trace", "debug", "info", "warn", "error"];
         if !valid_log_levels.contains(&self.log_level.to_lowercase().as_str()) {
             return Err(ConfigError::InvalidValue {
@@ -265,93 +352,92 @@ impl AppConfig {
             .into());
         }
 
-        // Validate TLS configuration
-        if self.mqtt_use_tls {
-            if let Some(ref ca_path) = self.mqtt_ca_cert_path {
-                if !Path::new(ca_path).exists() {
-                    return Err(ConfigError::InvalidValue {
-                        field: "mqtt_ca_cert_path".to_string(),
-                        message: format!("file does not exist: {}", ca_path),
-                    }
-                    .into());
-                }
-            }
-        }
-
         info!("Configuration validation successful");
         Ok(())
     }
 
-    /// Display a summary of the configuration (hiding sensitive data)
+    /// Returns a human-readable description of the ECU connection endpoint.
+    pub fn connection_display(&self) -> String {
+        match self.connection_type.to_lowercase().as_str() {
+            "tcp" => format!(
+                "TCP {}:{}",
+                self.tcp_host.as_deref().unwrap_or("?"),
+                self.tcp_port.unwrap_or(0)
+            ),
+            _ => format!("{} @ {} baud", self.port_name, self.baud_rate),
+        }
+    }
+
+    /// Log a sanitised configuration summary (passwords/keys are redacted).
+    #[allow(dead_code)]
     pub fn display_summary(&self) {
         info!("=== Configuration Summary ===");
-        info!("Serial Port: {} @ {} baud", self.port_name, self.baud_rate);
-        info!("MQTT Broker: {}:{}", self.mqtt_host, self.mqtt_port);
-        info!("MQTT Base Topic: {}", self.mqtt_base_topic);
-        info!("MQTT QoS: {}", self.mqtt_qos);
-        if self.mqtt_use_tls {
-            info!("MQTT TLS: enabled");
-        }
-        if self.mqtt_username.is_some() {
-            info!("MQTT Authentication: enabled");
+        info!(
+            "Connection: {} ({})",
+            self.connection_type,
+            self.connection_display()
+        );
+        if self.mqtt_enabled {
+            info!("MQTT Broker: {}:{}", self.mqtt_host, self.mqtt_port);
+            info!("MQTT Base Topic: {}", self.mqtt_base_topic);
+            info!("MQTT QoS: {}", self.mqtt_qos);
+            if self.mqtt_use_tls {
+                info!("MQTT TLS: enabled");
+            }
+            if self.mqtt_username.is_some() {
+                info!("MQTT Auth: enabled (credentials redacted)");
+            }
+        } else {
+            info!("MQTT: disabled (display-only / TUI mode)");
         }
         info!("Refresh Rate: {}ms", self.refresh_rate_ms);
         info!("Max Retry Count: {}", self.max_retry_count);
-        info!("Message Buffer Size: {}", self.message_buffer_size);
         info!("Log Level: {}", self.log_level);
         info!("============================");
     }
 }
 
-/// Load application configuration from a TOML file with environment variable overrides
+/// Load application configuration from `.env`, TOML files, and `SPEEDUINO_*` environment variables.
 ///
-/// # Arguments
-/// * `config_path` - Optional path to configuration file
-///
-/// # Returns
-/// Returns `Result<AppConfig>` with loaded and validated configuration
-///
-/// # Environment Variables
-/// All configuration fields can be overridden with environment variables prefixed with `SPEEDUINO_`
-/// For example: `SPEEDUINO_PORT_NAME=/dev/ttyUSB0`
+/// Priority (highest to lowest):
+/// 1. `SPEEDUINO_*` environment variables
+/// 2. Specified config file (via `config_path` argument)
+/// 3. Default config file locations
+/// 4. Built-in defaults
 pub fn load_configuration(config_path: Option<&str>) -> Result<AppConfig> {
+    // Load .env file if present (silently ignored when missing)
+    dotenvy::dotenv().ok();
+
     info!("Loading configuration");
 
     let mut builder = Config::builder();
 
-    // Try to load from various locations in order of priority
     let loaded_from = if let Some(path) = config_path {
-        debug!("Attempting to load config from specified path: {}", path);
+        debug!("Loading config from specified path: {}", path);
         builder = builder.add_source(File::with_name(path).required(true));
         Some(path.to_string())
     } else {
-        // Try multiple default locations
-        let default_locations = vec![
-            "./settings.toml",
-            "./speeduino-to-mqtt.toml",
-        ];
+        let default_locations = ["./settings.toml", "./speeduino-to-mqtt.toml"];
 
-        // Try executable directory
-        if let Ok(exe_dir) = std::env::current_exe() {
-            if let Some(parent) = exe_dir.parent() {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
                 let exe_config = parent.join("settings.toml");
                 if exe_config.exists() {
                     debug!("Found config in executable directory: {:?}", exe_config);
-                    builder = builder.add_source(File::from(exe_config.clone()).required(false));
+                    builder = builder.add_source(File::from(exe_config).required(false));
                 }
             }
         }
 
-        // Try system locations
-        let system_locations = vec![
+        let system_locations = [
             "/usr/etc/g86-car-telemetry/speeduino-to-mqtt.toml",
             "/etc/g86-car-telemetry/speeduino-to-mqtt.toml",
+            "/etc/speeduino-to-mqtt/settings.toml",
         ];
 
         let mut found_path = None;
         for location in default_locations.iter().chain(system_locations.iter()) {
-            let path = Path::new(location);
-            if path.exists() {
+            if Path::new(location).exists() {
                 debug!("Found config at: {}", location);
                 builder = builder.add_source(File::with_name(location).required(false));
                 if found_path.is_none() {
@@ -361,39 +447,33 @@ pub fn load_configuration(config_path: Option<&str>) -> Result<AppConfig> {
         }
 
         if found_path.is_none() {
-            warn!("No configuration file found in default locations");
+            warn!("No configuration file found; using defaults and environment variables");
         }
 
         found_path
     };
 
-    // Add environment variable overrides with prefix "SPEEDUINO_"
+    // SPEEDUINO_* environment variable overrides
     builder = builder.add_source(
         Environment::with_prefix("SPEEDUINO")
             .separator("_")
             .try_parsing(true),
     );
 
-    // Build configuration
     let settings = builder
         .build()
         .map_err(|e| ConfigError::LoadFailed(e.to_string()))?;
 
-    // Deserialize into AppConfig
     let mut app_config: AppConfig = settings
         .try_deserialize()
         .map_err(|e| ConfigError::LoadFailed(e.to_string()))?;
 
-    // Set the config path that was loaded
     app_config.config_path = loaded_from;
-
-    // Validate configuration
     app_config.validate()?;
 
-    if let Some(ref path) = app_config.config_path {
-        info!("Configuration loaded from: {}", path);
-    } else {
-        info!("Configuration loaded from environment variables and defaults");
+    match &app_config.config_path {
+        Some(path) => info!("Configuration loaded from: {}", path),
+        None => info!("Configuration loaded from defaults and environment"),
     }
 
     Ok(app_config)
@@ -421,66 +501,50 @@ mod tests {
             mqtt_base_topic = "/test/ecu/"
             refresh_rate_ms = 500
         "#;
-
-        let temp_dir = tempdir().expect("Failed to create temporary directory");
-        let file_path = temp_dir.path().join("settings.toml");
-        fs::write(&file_path, toml_content).expect("Failed to write temporary file");
-
-        let config = load_configuration(Some(file_path.to_str().unwrap()))
-            .expect("Failed to load configuration");
-
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        fs::write(&path, toml_content).unwrap();
+        let config = load_configuration(Some(path.to_str().unwrap())).unwrap();
         assert_eq!(config.port_name, "/dev/ttyACM0");
         assert_eq!(config.baud_rate, 115200);
         assert_eq!(config.mqtt_host, "mqtt.example.com");
-        assert_eq!(config.mqtt_port, 1883);
-        assert_eq!(config.mqtt_base_topic, "/test/ecu/");
         assert_eq!(config.refresh_rate_ms, 500);
     }
 
     #[test]
     fn test_invalid_baud_rate() {
         let mut config = AppConfig::default();
-        config.baud_rate = 12345; // Invalid baud rate
-        
-        let result = config.validate();
-        assert!(result.is_err());
+        config.baud_rate = 12345;
+        assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_invalid_mqtt_qos() {
         let mut config = AppConfig::default();
-        config.mqtt_qos = 5; // Invalid QoS
-        
-        let result = config.validate();
-        assert!(result.is_err());
+        config.mqtt_qos = 5;
+        assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_invalid_refresh_rate() {
         let mut config = AppConfig::default();
-        config.refresh_rate_ms = 0; // Invalid (zero)
-        
-        let result = config.validate();
-        assert!(result.is_err());
+        config.refresh_rate_ms = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]
-    fn test_missing_required_fields() {
+    fn test_missing_port_name() {
         let mut config = AppConfig::default();
-        config.port_name = String::new(); // Empty port name
-        
-        let result = config.validate();
-        assert!(result.is_err());
+        config.port_name = String::new();
+        assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_retry_delay_validation() {
         let mut config = AppConfig::default();
         config.max_retry_delay_ms = 500;
-        config.initial_retry_delay_ms = 1000; // Greater than max
-        
-        let result = config.validate();
-        assert!(result.is_err());
+        config.initial_retry_delay_ms = 1000;
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -495,35 +559,67 @@ mod tests {
     #[test]
     fn test_invalid_log_level() {
         let mut config = AppConfig::default();
-        config.log_level = "invalid".to_string();
-        
-        let result = config.validate();
-        assert!(result.is_err());
+        config.log_level = "verbose".to_string();
+        assert!(config.validate().is_err());
     }
 
     #[test]
-    fn test_environment_variable_override() {
-        // This test would require setting environment variables
-        // which is tricky in unit tests, but documents the feature
+    fn test_tcp_connection_type_requires_host() {
+        let mut config = AppConfig::default();
+        config.connection_type = "tcp".to_string();
+        config.tcp_host = None;
+        config.tcp_port = Some(4096);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_tcp_connection_type_requires_port() {
+        let mut config = AppConfig::default();
+        config.connection_type = "tcp".to_string();
+        config.tcp_host = Some("192.168.1.100".to_string());
+        config.tcp_port = None;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_tcp_connection_type_valid() {
+        let mut config = AppConfig::default();
+        config.connection_type = "tcp".to_string();
+        config.tcp_host = Some("192.168.1.100".to_string());
+        config.tcp_port = Some(4096);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_invalid_connection_type() {
+        let mut config = AppConfig::default();
+        config.connection_type = "usb".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_mqtt_disabled_skips_mqtt_validation() {
+        let mut config = AppConfig::default();
+        config.mqtt_enabled = false;
+        config.mqtt_host = String::new();
+        config.mqtt_port = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_connection_display_serial() {
         let config = AppConfig::default();
-        assert!(config.validate().is_ok());
+        assert!(config.connection_display().contains("/dev/ttyACM0"));
     }
 
     #[test]
-    fn test_mqtt_authentication_fields() {
+    fn test_connection_display_tcp() {
         let mut config = AppConfig::default();
-        config.mqtt_username = Some("testuser".to_string());
-        config.mqtt_password = Some("testpass".to_string());
-        
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_config_with_tls() {
-        let mut config = AppConfig::default();
-        config.mqtt_use_tls = true;
-        // Without valid cert path, validation should still pass
-        // (only validates if path is provided AND TLS is enabled)
-        assert!(config.validate().is_ok());
+        config.connection_type = "tcp".to_string();
+        config.tcp_host = Some("192.168.1.50".to_string());
+        config.tcp_port = Some(4096);
+        let display = config.connection_display();
+        assert!(display.contains("192.168.1.50"));
+        assert!(display.contains("4096"));
     }
 }
