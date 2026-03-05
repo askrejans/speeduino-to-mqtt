@@ -15,12 +15,14 @@ use tracing::{debug, error, info, warn};
 /// ECU command to request realtime data
 const ECU_COMMAND: u8 = b'A';
 
-/// Time to wait after sending the command before reading.
-/// At 115200 baud, 138 bytes take ~12 ms to transmit.  100 ms ensures the
-/// entire packet is sitting in the OS buffer before read_exact() is called,
-/// eliminating inter-chunk timing issues on USB-CDC (macOS delivers data in
-/// 64-byte USB packets with small gaps between them).
-const COMMAND_PROCESSING_DELAY_MS: u64 = 100;
+/// Time to wait after sending the command before draining the buffer.
+/// At 115200 baud, 138 bytes take ~12 ms to transmit.  150 ms gives
+/// comfortable headroom for any Speeduino firmware version so the entire
+/// packet is sitting in the OS buffer before we start reading.
+const COMMAND_PROCESSING_DELAY_MS: u64 = 150;
+
+/// Maximum response buffer size — larger than any known Speeduino packet.
+const MAX_PACKET_BYTES: usize = 256;
 
 /// ECU connection handler — supports hardware serial and TCP (e.g. WiFi bridge).
 pub struct EcuSerialHandler {
@@ -69,18 +71,15 @@ impl EcuSerialHandler {
 
     /// Read engine data from the ECU
     ///
-    /// Flushes the hardware buffer, sends 'A', waits for the full packet to
-    /// accumulate in the OS buffer, then reads exactly `expected_data_length`
-    /// bytes.  Any trailing bytes (real firmware 138 B vs sim 130 B) are left
-    /// in the buffer and cleared at the start of the next cycle.
+    /// Flushes the hardware buffer, sends 'A', then sleeps long enough for the
+    /// ECU to finish transmitting before draining whatever arrived.  Because we
+    /// wait before reading, all bytes are already in the OS buffer — each
+    /// non-blocking drain read completes instantly.  No `read_exact` means no
+    /// hang regardless of firmware packet size (130, 138, or anything else).
     pub async fn read_engine_data(&mut self) -> Result<Vec<u8>> {
         let conn = self.connection.as_mut().ok_or(SerialError::Disconnected)?;
 
         // ── Flush hardware buffer before sending ──────────────────────────────
-        // Clears any leftover bytes from the previous cycle (e.g. the 8 extra
-        // bytes real firmware appends beyond the 130-byte sim packet).
-        // No-op for TCP — stale bytes on TCP are rare since read_exact consumes
-        // exactly the right count every cycle.
         conn.clear_buffers().ok();
 
         // ── Send command ──────────────────────────────────────────────────────
@@ -90,32 +89,39 @@ impl EcuSerialHandler {
             .map_err(SerialError::WriteFailed)?;
         conn.flush().await.map_err(SerialError::WriteFailed)?;
 
-        // ── Wait for ECU to transmit the full packet ──────────────────────────
-        // By sleeping before reading we let the OS buffer the entire response.
-        // read_exact() then drains it in one shot — no inter-chunk gap risk.
+        // ── Wait for ECU to finish transmitting ───────────────────────────────
         sleep(Duration::from_millis(COMMAND_PROCESSING_DELAY_MS)).await;
 
-        // ── Read exactly expected_data_length bytes ───────────────────────────
-        let mut buffer = vec![0u8; self.config.expected_data_length];
-        match timeout(
-            Duration::from_millis(self.config.read_timeout_ms),
-            conn.read_exact(&mut buffer),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {
-                debug!("Received {} bytes from ECU", buffer.len());
-                Ok(buffer)
-            }
-            Ok(Err(e)) => Err(SerialError::ReadFailed(e).into()),
-            Err(_) => {
-                warn!("Read timeout after {}ms", self.config.read_timeout_ms);
-                Err(SerialError::ReadTimeout {
-                    timeout_ms: self.config.read_timeout_ms,
+        // ── Drain whatever is in the OS buffer ────────────────────────────────
+        // All bytes have already arrived during the sleep above.  Use a 5 ms
+        // per-read deadline so each call returns almost immediately rather than
+        // blocking.  Stop when no more data is available or the buffer is full.
+        let mut buffer: Vec<u8> = Vec::with_capacity(MAX_PACKET_BYTES);
+        loop {
+            let mut tmp = [0u8; 64];
+            match timeout(Duration::from_millis(5), conn.read(&mut tmp)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    buffer.extend_from_slice(&tmp[..n]);
+                    if buffer.len() >= MAX_PACKET_BYTES {
+                        break;
+                    }
                 }
-                .into())
+                Ok(Err(e)) => return Err(SerialError::ReadFailed(e).into()),
+                Err(_) => break, // 5 ms elapsed with no more bytes — buffer drained
             }
         }
+
+        if buffer.is_empty() {
+            warn!("No data received from ECU");
+            return Err(SerialError::ReadTimeout {
+                timeout_ms: self.config.read_timeout_ms,
+            }
+            .into());
+        }
+
+        debug!("Received {} bytes from ECU", buffer.len());
+        Ok(buffer)
     }
 
     /// Attempt to reconnect with exponential backoff
