@@ -16,6 +16,8 @@ A Rust application that reads real-time engine data from a [Speeduino](https://s
 
 > **Testing:** [speeduino-serial-sim](https://github.com/askrejans/speeduino-serial-sim) can be used to generate synthetic ECU data without a real ECU.
 
+<img width="1344" height="806" alt="Screenshot 2026-03-09 at 21 20 44" src="https://github.com/user-attachments/assets/e4e255c0-e1d1-4e81-91ec-810c47b5e7f7" />
+
 ## Running modes
 
 | Invocation | Behaviour |
