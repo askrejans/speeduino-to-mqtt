@@ -460,10 +460,12 @@ pub fn load_configuration(config_path: Option<&str>) -> Result<AppConfig> {
         found_path
     };
 
-    // SPEEDUINO_* environment variable overrides
+    // SPEEDUINO_* environment variable overrides.
+    // No separator: SPEEDUINO_MQTT_ENABLED → "mqtt_enabled" (flat key).
+    // With separator("_") the crate converts underscores to dots producing
+    // nested keys like "mqtt.enabled" which don't match the flat struct fields.
     builder = builder.add_source(
         Environment::with_prefix("SPEEDUINO")
-            .separator("_")
             .try_parsing(true),
     );
 

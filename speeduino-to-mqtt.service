@@ -3,6 +3,8 @@ Description=Speeduino ECU to MQTT Bridge
 Documentation=https://github.com/askrejans/speeduino-to-mqtt
 After=network-online.target
 Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
@@ -10,19 +12,17 @@ User=speeduino
 Group=speeduino
 
 # Path to the binary
-ExecStart=/usr/local/bin/speeduino-to-mqtt --config /etc/speeduino-to-mqtt/settings.toml
+ExecStart=/usr/bin/speeduino-to-mqtt --config /etc/speeduino-to-mqtt/settings.toml
 
-# Working directory
-WorkingDirectory=/var/lib/speeduino-to-mqtt
+# Working directory (app writes no state; /tmp is always available)
+WorkingDirectory=/tmp
 
 # Restart policy
 Restart=always
 RestartSec=10
-StartLimitBurst=5
-StartLimitIntervalSec=60
 
 # Resource limits
-MemoryLimit=256M
+MemoryMax=256M
 CPUQuota=50%
 
 # Security hardening
@@ -30,7 +30,6 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/speeduino-to-mqtt
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -39,11 +38,12 @@ RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
 
-# Device access - allow serial port
-DevicePolicy=closed
-# Uncomment and adjust the serial device path as needed:
-DeviceAllow=/dev/ttyACM0 rw
-# DeviceAllow=/dev/ttyUSB0 rw
+# Serial / TTY access – allow any device the service user can reach.
+# The 'dialout' and 'tty' groups give access to /dev/ttyACM*, /dev/ttyUSB*,
+# /dev/ttyS*, etc. without hard-coding a specific device path.
+# DevicePolicy defaults to 'auto', which inherits the parent cgroup's device
+# list and is not restricted further here.
+SupplementaryGroups=dialout tty
 
 # Capabilities
 CapabilityBoundingSet=

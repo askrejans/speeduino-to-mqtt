@@ -1,6 +1,6 @@
 [package]
 name = "speeduino-to-mqtt"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 
 [dependencies]
@@ -28,10 +28,6 @@ anyhow = "1.0.102"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Signal handling for graceful shutdown
-signal-hook = "0.4.3"
-signal-hook-tokio = { version = "0.4.0", features = ["futures-v0_3"] }
-
 # CLI
 gumdrop = "0.8.1"
 atty = "0.2.14"
@@ -39,6 +35,11 @@ atty = "0.2.14"
 # TUI
 ratatui = "0.30.0"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
+
+# Signal handling for graceful shutdown (Unix only; Windows uses tokio::signal)
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.4.3"
+signal-hook-tokio = { version = "0.4.0", features = ["futures-v0_3"] }
 
 [dev-dependencies]
 tempdir = "0.3.7"

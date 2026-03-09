@@ -21,10 +21,7 @@ use crate::ecu_data_parser::{SpeeduinoData, process_speeduino_realtime_data};
 use crate::ecu_serial_comms_handler::EcuSerialHandler;
 use crate::mqtt_handler::{MqttHandler, MqttMessage};
 use crate::tui::{TuiState, TuiWriter, run_tui};
-use futures_util::stream::StreamExt;
 use gumdrop::Options;
-use signal_hook::consts::signal::*;
-use signal_hook_tokio::Signals;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::select;
@@ -107,17 +104,36 @@ fn init_logging_tui(config: &AppConfig, writer: TuiWriter) {
 // Signal handler
 // ---------------------------------------------------------------------------
 
-async fn wait_for_signal(mut signals: Signals, cancel: CancellationToken) {
-    while let Some(signal) = signals.next().await {
-        match signal {
-            SIGTERM | SIGINT => {
-                info!("Received shutdown signal ({})", signal);
-                cancel.cancel();
-                break;
+fn spawn_signal_handler(cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use futures_util::stream::StreamExt;
+            use signal_hook::consts::signal::{SIGINT, SIGTERM};
+            use signal_hook_tokio::Signals;
+            match Signals::new([SIGTERM, SIGINT]) {
+                Ok(mut signals) => {
+                    while let Some(signal) = signals.next().await {
+                        match signal {
+                            SIGTERM | SIGINT => {
+                                info!("Received shutdown signal ({})", signal);
+                                cancel.cancel();
+                                return;
+                            }
+                            _ => warn!("Unhandled signal: {}", signal),
+                        }
+                    }
+                }
+                Err(e) => error!("Failed to register signal handlers: {}", e),
             }
-            _ => warn!("Unhandled signal: {}", signal),
         }
-    }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Received Ctrl+C");
+            cancel.cancel();
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -132,7 +148,7 @@ async fn ecu_communication_loop(
 ) -> anyhow::Result<()> {
     let mut handler = EcuSerialHandler::new((*config).clone());
 
-    // Initial connection with backoff
+    // Initial connection with backoff – retries indefinitely, never exits.
     loop {
         if cancel.is_cancelled() {
             return Ok(());
@@ -150,10 +166,13 @@ async fn ecu_communication_loop(
             Err(e) => {
                 error!("Failed to connect to ECU: {}", e);
                 if handler.get_retry_count() >= config.max_retry_count {
-                    error!("Max connection attempts exceeded");
-                    return Err(e.into());
+                    warn!(
+                        "Max connection attempts reached – resetting counter and retrying indefinitely"
+                    );
+                    handler.reset_retry_count();
                 }
-                handler.reconnect().await?;
+                // Ignore reconnect error; backoff sleep already happened inside reconnect().
+                let _ = handler.reconnect().await;
             }
         }
     }
@@ -187,7 +206,9 @@ async fn ecu_communication_loop(
             } else {
                 consecutive_errors += 1;
                 if consecutive_errors >= MAX_ERRORS {
-                    return Err(anyhow::anyhow!("ECU reconnection failed too many times"));
+                    warn!("Reconnection failed too many times – resetting counter and retrying indefinitely");
+                    handler.reset_retry_count();
+                    consecutive_errors = 0;
                 }
             }
             continue;
@@ -222,7 +243,12 @@ async fn ecu_communication_loop(
                             consecutive_errors = 0;
                             tui_state.write().await.ecu_connected = true;
                         }
-                        Err(e) => return Err(e.into()),
+                        Err(e) => {
+                            warn!("Reconnect failed after read errors: {} – resetting and retrying indefinitely", e);
+                            handler.reset_retry_count();
+                            consecutive_errors = 0;
+                            tui_state.write().await.ecu_connected = false;
+                        }
                     }
                 }
             }
@@ -290,8 +316,10 @@ async fn main() -> anyhow::Result<()> {
     // Shared cancellation token
     let cancel = CancellationToken::new();
 
-    // Detect whether stdin is a TTY – show TUI when running interactively
-    let is_tty = atty::is(atty::Stream::Stdout);
+    // Detect whether stdin is a TTY – show TUI when running interactively.
+    // SPEEDUINO_NO_TUI=1 forces service/log mode (set by default in Docker).
+    let force_no_tui = std::env::var("SPEEDUINO_NO_TUI").map(|v| v == "1").unwrap_or(false);
+    let is_tty = !force_no_tui && atty::is(atty::Stream::Stdout);
 
     // Shared state for TUI
     let log_buffer: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -321,10 +349,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Signal handler
-    let signals = Signals::new([SIGTERM, SIGINT])?;
-    let signals_handle = signals.handle();
-    let signals_cancel = cancel.clone();
-    let signals_task = tokio::spawn(wait_for_signal(signals, signals_cancel));
+    let signals_task = spawn_signal_handler(cancel.clone());
 
     // Optional MQTT setup — handler must stay on the main task (paho futures are !Send)
     let (mqtt_sender, mqtt_handler_opt): (Option<mpsc::Sender<MqttMessage>>, Option<MqttHandler>) =
@@ -418,7 +443,6 @@ async fn main() -> anyhow::Result<()> {
         let _ = t.await;
     }
 
-    signals_handle.close();
     let _ = signals_task.await;
 
     info!("Goodbye!");

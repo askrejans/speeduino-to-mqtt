@@ -25,7 +25,154 @@ A Rust application that reads real-time engine data from a [Speeduino](https://s
 | `mqtt_enabled = false` | No broker needed; data shown in TUI only |
 | `mqtt_enabled = true` (default) | Data published to MQTT broker |
 
-## Quick start
+---
+
+## Installation
+
+Pre-built packages are available for all major platforms — no Rust toolchain needed.
+
+### Debian / Ubuntu
+
+```bash
+curl -fsSL https://g86racing.com/packages/apt/gpg.key | sudo gpg --dearmor \
+     -o /usr/share/keyrings/speeduino-archive-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/speeduino-archive-keyring.gpg] \
+     https://g86racing.com/packages/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/speeduino.list
+
+sudo apt update
+sudo apt install speeduino-to-mqtt
+```
+
+### Fedora / RHEL / Rocky Linux
+
+```bash
+sudo tee /etc/yum.repos.d/g86racing.repo <<'EOF'
+[g86racing]
+name=G86Racing packages
+baseurl=https://g86racing.com/packages/rpm
+enabled=1
+gpgcheck=0
+EOF
+
+sudo dnf install speeduino-to-mqtt
+```
+
+### macOS (Homebrew)
+
+```bash
+brew tap askrejans/g86racing
+brew install speeduino-to-mqtt
+```
+
+To run as a background service (launchd):
+
+```bash
+brew services start askrejans/g86racing/speeduino-to-mqtt
+```
+
+Config is installed to `$(brew --prefix)/etc/speeduino-to-mqtt/settings.toml.example`.
+
+### Windows
+
+1. Download the latest `.zip` from [https://g86racing.com/packages/windows/](https://g86racing.com/packages/windows/).
+2. Extract and copy `settings.toml.example` → `settings.toml`, then edit it.
+3. Run interactively: `.\speeduino-to-mqtt.exe --config settings.toml`
+4. Install as a Windows Service (optional, using [NSSM](https://nssm.cc)):
+
+```powershell
+nssm install speeduino-to-mqtt "C:\speeduino-to-mqtt\speeduino-to-mqtt.exe"
+nssm set    speeduino-to-mqtt AppParameters "--config C:\speeduino-to-mqtt\settings.toml"
+nssm start  speeduino-to-mqtt
+```
+
+### After Linux installation
+
+```bash
+sudo cp /etc/speeduino-to-mqtt/settings.toml.example /etc/speeduino-to-mqtt/settings.toml
+sudo $EDITOR /etc/speeduino-to-mqtt/settings.toml
+sudo systemctl start speeduino-to-mqtt
+```
+
+---
+
+## Docker
+
+The easiest way to run on any Linux machine or Raspberry Pi — no Rust toolchain needed.
+
+### Quick start (serial connection)
+
+```bash
+# 1 – Clone / download the repo (or just grab docker-compose.yml)
+git clone https://github.com/askrejans/speeduino-to-mqtt
+cd speeduino-to-mqtt
+
+# 2 – Edit the environment variables in docker-compose.yml
+#     (SPEEDUINO_MQTT_HOST, SPEEDUINO_PORT_NAME, etc.)
+$EDITOR docker-compose.yml
+
+# 3 – Build and start
+docker compose up -d
+
+# Follow logs
+docker compose logs -f
+```
+
+### Quick start (TCP / Wi-Fi bridge)
+
+Uncomment the `speeduino-to-mqtt-tcp` service in `docker-compose.yml` and set `SPEEDUINO_TCP_HOST` / `SPEEDUINO_TCP_PORT`.
+
+### docker-compose.yml reference
+
+All configuration is done via **environment variables** in `docker-compose.yml` — no config file editing required.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SPEEDUINO_CONNECTION_TYPE` | `serial` | `serial` or `tcp` |
+| `SPEEDUINO_PORT_NAME` | `/dev/ttyACM0` | Serial device inside the container |
+| `SPEEDUINO_BAUD_RATE` | `115200` | Serial baud rate |
+| `SPEEDUINO_TCP_HOST` | — | TCP bridge hostname / IP |
+| `SPEEDUINO_TCP_PORT` | — | TCP bridge port |
+| `SPEEDUINO_MQTT_ENABLED` | `true` | Set `false` for display-only |
+| `SPEEDUINO_MQTT_HOST` | `localhost` | MQTT broker hostname |
+| `SPEEDUINO_MQTT_PORT` | `1883` | MQTT broker port |
+| `SPEEDUINO_MQTT_BASE_TOPIC` | `/GOLF86/ECU/` | Base MQTT topic prefix |
+| `SPEEDUINO_MQTT_USERNAME` | — | Broker username (optional) |
+| `SPEEDUINO_MQTT_PASSWORD` | — | Broker password (optional) |
+| `SPEEDUINO_LOG_LEVEL` | `info` | `trace` \| `debug` \| `info` \| `warn` \| `error` |
+
+### Using a settings.toml file instead
+
+Mount your own config file over the default:
+
+```yaml
+# docker-compose.yml
+volumes:
+  - ./settings.toml:/etc/speeduino-to-mqtt/settings.toml:ro
+```
+
+Environment variables always take priority over the file, so you can use both.
+
+### Serial port access on Linux
+
+The container user is added to the `dialout` group. Ensure your host user can also access the device:
+
+```bash
+sudo usermod -aG dialout $USER   # then log out and back in
+```
+
+### Build the image yourself
+
+```bash
+docker build -t speeduino-to-mqtt .
+```
+
+---
+
+## Building from source
+
+### Quick start
 
 ```bash
 # 1 – Build
@@ -51,6 +198,8 @@ Options:
   -h, --help          Print help
   -c, --config FILE   Path to TOML config file (default: settings.toml)
 ```
+
+---
 
 ## Configuration
 
@@ -94,6 +243,8 @@ Key environment variables:
 | `SPEEDUINO_MQTT_HOST` / `SPEEDUINO_MQTT_PORT` | Broker address |
 | `SPEEDUINO_MQTT_USERNAME` / `SPEEDUINO_MQTT_PASSWORD` | Broker credentials |
 | `SPEEDUINO_LOG_LEVEL` | `trace` \| `debug` \| `info` \| `warn` \| `error` |
+
+---
 
 ## MQTT topics
 
@@ -204,43 +355,100 @@ All values are published to `<mqtt_base_topic><CODE>`, e.g. `/GOLF86/ECU/RPM`.
 | `SDS` | SD card / TunerStudio status |
 | `EMP` | EMAP pressure (published only when packet ≥ 121 bytes) |
 
-## Building packages (DEB / RPM)
+---
 
-The `scripts/build_packages.sh` script cross-compiles the binary and assembles installable packages for **x86-64** and **arm64** using `cross`, `dpkg-deb`, and `rpmbuild`.
+## Building packages
+
+The `scripts/build_packages.sh` script cross-compiles for **all platforms**.
+
+### Targets
+
+| Platform | Arch   | Rust triple                     | Output     |
+|----------|--------|---------------------------------|------------|
+| Linux    | x64    | x86_64-unknown-linux-gnu        | .deb + .rpm |
+| Linux    | arm64  | aarch64-unknown-linux-gnu       | .deb + .rpm |
+| Windows  | x64    | x86_64-pc-windows-gnu           | .zip       |
+| macOS    | x64    | x86_64-apple-darwin             | .tar.gz    |
+| macOS    | arm64  | aarch64-apple-darwin            | .tar.gz    |
+
+### Mac prerequisites
 
 ```bash
-# Build DEB + RPM for both architectures (requires cross, dpkg-dev, rpm-build)
+# Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# cross – Docker-based cross-compiler for Linux + Windows targets
+cargo install cross
+# Docker Desktop must be running (and Rosetta enabled for Apple Silicon)
+
+# macOS SDK (already present if Xcode CLT is installed)
+xcode-select --install
+
+# macOS cross-arch targets (native cargo, no Docker needed)
+rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+# Apple Silicon: pre-install the cross-compilation toolchains that 'cross'
+# needs to mount into Docker. --force-non-host allows installing toolchains
+# that can't execute natively on ARM Mac but are needed inside the container.
+for TRIPLE in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu; do
+    rustup toolchain install stable-$TRIPLE --force-non-host --profile minimal
+done
+
+# Apple Silicon Docker prerequisite: enable in Docker Desktop →
+#   Settings → General → "Use Rosetta for x86/amd64 emulation on Apple Silicon"
+
+# DEB packaging tool
+brew install dpkg
+
+# RPM packaging tool
+brew install rpm
+```
+
+### Build commands
+
+```bash
+# Everything – all platforms, all arches, all package types
 ./scripts/build_packages.sh
 
-# Single architecture / format
-./scripts/build_packages.sh --arch arm64 --type deb
+# Linux only (DEB + RPM, all arches)
+./scripts/build_packages.sh --platform linux
 
-# Use local cargo toolchain instead of cross
+# Single format / arch
+./scripts/build_packages.sh --platform linux  --arch arm64 --type deb
+./scripts/build_packages.sh --platform windows --arch x64
+./scripts/build_packages.sh --platform mac     --arch arm64
+
+# Use local cargo instead of cross (you must have all toolchains installed)
 ./scripts/build_packages.sh --no-cross
 
-# Help
 ./scripts/build_packages.sh --help
 ```
 
-Packages are written to `release/<version>/deb/` and `release/<version>/rpm/`.
+Output layout:
 
-Each package:
+```
+release/<version>/
+  linux/
+    deb/   *.deb (amd64, arm64)
+    rpm/   *.rpm (x86_64, aarch64)
+  windows/
+         *.zip (x64)
+  mac/
+         *.tar.gz (x86_64, arm64)
+         sha256sums.txt
+```
+
+Each Linux package:
 - Installs the binary to `/usr/bin/speeduino-to-mqtt`
 - Installs the systemd unit to `/lib/systemd/system/speeduino-to-mqtt.service`
-- Places an example config in `/etc/speeduino-to-mqtt/settings.toml.example`
-- Enables the service via `systemctl enable` in the post-install script
+- Drops an example config at `/etc/speeduino-to-mqtt/settings.toml.example`
+- Creates a `speeduino` system user (in `dialout` + `tty` groups for serial access)
+- Enables the service on install
 
-After installation:
-
-```bash
-sudo cp /etc/speeduino-to-mqtt/settings.toml.example /etc/speeduino-to-mqtt/settings.toml
-sudo $EDITOR /etc/speeduino-to-mqtt/settings.toml
-sudo systemctl start speeduino-to-mqtt
-```
+---
 
 ## Related projects
 
 - [speeduino-serial-sim](https://github.com/askrejans/speeduino-serial-sim) – ECU data simulator for testing
 - [GPS-to-MQTT](https://github.com/askrejans/gps-to-mqtt) – companion GPS bridge
 - [G86 Web Dashboard](https://github.com/askrejans/G86-web-dashboard) – web dashboard for MQTT telemetry data
-

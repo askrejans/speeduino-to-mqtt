@@ -1,0 +1,8 @@
+target/
+release/
+.git/
+.env
+*.env
+settings.toml
+scripts/
+.cargo/

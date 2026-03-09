@@ -1,0 +1,48 @@
+services:
+
+  speeduino-to-mqtt:
+    # ── Image ────────────────────────────────────────────────────────────────
+    # Option A – build locally from source:
+    build: .
+    # Option B – use the pre-built image from the registry:
+    # image: ghcr.io/askrejans/speeduino-to-mqtt:latest
+
+    restart: unless-stopped
+
+    # ── Serial device (serial connection only) ───────────────────────────────
+    # Uncomment and adjust if connecting via USB/serial port.
+    # Common paths: /dev/ttyACM0, /dev/ttyUSB0, /dev/ttyS0
+    # devices:
+    #   - /dev/ttyACM0:/dev/ttyACM0
+
+    environment:
+
+      # ── Connection type ─────────────────────────────────────────────────────
+      # "serial" – direct USB/serial (uncomment devices block above)
+      # "tcp"    – Wi-Fi / Ethernet serial bridge (ESP32, Moxa, USR-VIS410 …)
+      SPEEDUINO_CONNECTION_TYPE: serial
+
+      # ── Serial settings (used when CONNECTION_TYPE=serial) ──────────────────
+      SPEEDUINO_PORT_NAME: /dev/ttyACM0   # device path inside the container
+      SPEEDUINO_BAUD_RATE: "115200"
+
+      # ── TCP settings (used when CONNECTION_TYPE=tcp) ─────────────────────────
+      # SPEEDUINO_TCP_HOST: 192.168.1.100  # IP or hostname of the serial bridge
+      # SPEEDUINO_TCP_PORT: "23"           # port exposed by the bridge
+
+      # ── MQTT broker ──────────────────────────────────────────────────────────
+      SPEEDUINO_MQTT_ENABLED: "true"       # set "false" for display/log-only mode
+      SPEEDUINO_MQTT_HOST: mqtt.local      # broker IP or hostname
+      SPEEDUINO_MQTT_PORT: "1883"
+      SPEEDUINO_MQTT_BASE_TOPIC: /CAR/ECU/
+      # SPEEDUINO_MQTT_USERNAME: ""
+      # SPEEDUINO_MQTT_PASSWORD: ""
+
+      # ── Logging ──────────────────────────────────────────────────────────────
+      # trace | debug | info | warn | error
+      SPEEDUINO_LOG_LEVEL: info
+
+    # ── Optional: mount a settings.toml instead of / in addition to env vars ──
+    # Env vars always take priority over the file.
+    # volumes:
+    #   - ./settings.toml:/etc/speeduino-to-mqtt/settings.toml:ro
